@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+import os
+import re
+import json
+import sys
+import shutil
+import subprocess
+
+from flask import Flask, request, jsonify, send_from_directory
+import yt_dlp
+import librosa
+import numpy as np
+
+app = Flask(__name__, static_folder="static")
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def extract_video_id(url):
+    patterns = [
+        r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_video_title(url):
+    try:
+        opts = {"quiet": True, "skip_download": True, "no_warnings": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "Unknown"), info.get("uploader", "")
+    except Exception:
+        return "Unknown", ""
+
+
+def download_audio(url, base_path):
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": base_path + ".%(ext)s",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+            }
+        ],
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    wav = base_path + ".wav"
+    if os.path.exists(wav):
+        return wav
+
+    # Fallback: find any downloaded file and convert manually
+    for ext in ["m4a", "webm", "mp3", "ogg", "opus"]:
+        src = base_path + "." + ext
+        if os.path.exists(src):
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src, wav],
+                capture_output=True,
+            )
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            if os.path.exists(wav):
+                return wav
+
+    raise FileNotFoundError(f"Could not produce WAV from {url}")
+
+
+STEM_NAMES = {'vocals': 'vocals', 'bass': 'bass', 'drums': 'drums', 'guitar': 'other'}
+
+def separate_and_get_stem(full_wav, video_id, mode):
+    """Run Demucs on full_wav and return the path to the requested stem WAV.
+    Stems are cached in cache/{video_id}_stems/ for reuse across modes."""
+    stem_file = STEM_NAMES[mode]
+    stems_dir = os.path.join(CACHE_DIR, f"{video_id}_stems")
+    target = os.path.join(stems_dir, f"{stem_file}.wav")
+    if os.path.exists(target):
+        return target
+    os.makedirs(stems_dir, exist_ok=True)
+    tmp_out = os.path.join(CACHE_DIR, f"{video_id}_dtmp")
+    track = os.path.splitext(os.path.basename(full_wav))[0]
+    result = subprocess.run(
+        [sys.executable, "-m", "demucs", "-n", "htdemucs",
+         "--out", tmp_out, full_wav],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "")[-600:].strip()
+        raise RuntimeError(detail or f"exit code {result.returncode}")
+    src_base = os.path.join(tmp_out, "htdemucs", track)
+    for sn in STEM_NAMES.values():
+        src = os.path.join(src_base, f"{sn}.wav")
+        dst = os.path.join(stems_dir, f"{sn}.wav")
+        if os.path.exists(src) and not os.path.exists(dst):
+            os.rename(src, dst)
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    if not os.path.exists(target):
+        raise FileNotFoundError(f"Demucs did not produce {stem_file}.wav")
+    return target
+
+
+def generate_chart(audio_path):
+    SR = 22050
+    HOP = 512
+
+    y, sr = librosa.load(audio_path, sr=SR, mono=True)
+    duration = float(librosa.get_duration(y=y, sr=sr))
+
+    # Beat tracking
+    tempo_arr, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
+    tempo = float(np.atleast_1d(tempo_arr)[0])
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=HOP)
+
+    # RMS noise gate — per-frame energy, used to reject silent / bleed-through regions
+    frame_rms = librosa.feature.rms(y=y, hop_length=HOP)[0]
+    rms_peak  = float(np.max(frame_rms)) + 1e-9
+    # A frame must reach at least 6% of peak RMS to produce a note.
+    # This filters demucs bleed-through noise while keeping genuine soft notes.
+    NOISE_GATE = 0.06
+
+    # Onset detection
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP, aggregate=np.median)
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env, sr=sr, hop_length=HOP,
+        backtrack=True, units="frames", delta=0.10,
+    )
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=HOP)
+    onset_strengths = onset_env[np.clip(onset_frames, 0, len(onset_env) - 1)]
+
+    # Apply noise gate: drop onsets in silent / near-silent regions
+    gate_mask = np.array([
+        float(frame_rms[min(f, len(frame_rms) - 1)]) / rms_peak >= NOISE_GATE
+        for f in onset_frames
+    ])
+    onset_frames    = onset_frames[gate_mask]
+    onset_times     = onset_times[gate_mask]
+    onset_strengths = onset_strengths[gate_mask]
+
+    # Harmonic/percussive separation
+    y_harm, y_perc = librosa.effects.hpss(y)
+    harm_stft = np.abs(librosa.stft(y_harm, hop_length=HOP))
+    perc_stft = np.abs(librosa.stft(y_perc, hop_length=HOP))
+    harm_rms = np.sqrt(np.mean(harm_stft ** 2, axis=0))
+    perc_rms = np.sqrt(np.mean(perc_stft ** 2, axis=0))
+
+    # Spectral centroid — smoothed with moving average for stable lane mapping
+    centroid_raw = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP)[0]
+    win = 21
+    centroid = np.convolve(centroid_raw, np.ones(win) / win, mode='same')
+
+    # Global 5th–95th percentile range for consistent lane mapping across the song
+    c_lo = float(np.percentile(centroid, 5))
+    c_hi = float(np.percentile(centroid, 95))
+
+    def centroid_to_lane(frame_idx):
+        c = float(centroid[min(frame_idx, len(centroid) - 1)])
+        norm = (c - c_lo) / max(c_hi - c_lo, 1.0)
+        return int(np.clip(norm * 4, 0, 3))
+
+    # Beat-snap: build 8th-note grid, keep strongest onset per slot
+    if len(beat_times) > 1:
+        avg_beat = float(np.mean(np.diff(beat_times)))
+    else:
+        avg_beat = 60.0 / max(tempo, 60.0)
+    eighth_dur = avg_beat / 2.0
+
+    t_start = float(onset_times[0]) - avg_beat if len(onset_times) else 0.0
+    t_start = max(0.0, t_start)
+    grid = np.arange(t_start, duration + eighth_dur, eighth_dur)
+
+    slot_best = {}  # slot_idx -> (strength, onset_time, onset_frame_idx)
+    for i, (ot, st) in enumerate(zip(onset_times, onset_strengths)):
+        slot = int(np.argmin(np.abs(grid - ot)))
+        if slot not in slot_best or st > slot_best[slot][0]:
+            slot_best[slot] = (float(st), float(ot), int(onset_frames[i]))
+
+    snapped = sorted(slot_best.values(), key=lambda x: x[1])
+    if not snapped:
+        return {"bpm": tempo, "duration": duration, "notes": []}
+
+    strength_thresh = float(np.percentile([s[0] for s in snapped], 50))
+
+    # Beat index just before time t
+    def beat_index_at(t):
+        idx = int(np.searchsorted(beat_times, t, side='right')) - 1
+        return max(0, idx)
+
+    def phrase_of(t):
+        return beat_index_at(t) // 4
+
+    # Per-phrase average energy → density control
+    phrase_strengths = {}
+    for st, ot, _ in snapped:
+        phrase_strengths.setdefault(phrase_of(ot), []).append(st)
+    phrase_avg = {p: float(np.mean(v)) for p, v in phrase_strengths.items()}
+
+    if phrase_avg:
+        pvals = list(phrase_avg.values())
+        e_lo = float(np.percentile(pvals, 33))
+        e_hi = float(np.percentile(pvals, 67))
+        def phrase_energy(p):
+            e = phrase_avg.get(p, e_lo)
+            return 'high' if e > e_hi else ('low' if e < e_lo else 'mid')
+    else:
+        def phrase_energy(p): return 'mid'
+
+    # Percussive rhythm template: kick feel on D/K, hi-hat feel on F/J
+    PERC_PATTERN = [0, 1, 3, 2, 0, 2, 3, 1]
+
+    notes = []
+    last_lane_time = [-999.0] * 4
+    last_lane_free = [-999.0] * 4
+    last_any_time = -999.0
+    MIN_LANE_GAP = 0.10
+    MIN_GLOBAL_GAP = 0.04
+    HOLD_MIN = 0.30
+
+    phrase_note_count = {}
+
+    for strength, onset_time, onset_frame in snapped:
+        if strength < strength_thresh:
+            continue
+        if onset_time - last_any_time < MIN_GLOBAL_GAP:
+            continue
+
+        p = phrase_of(onset_time)
+        energy = phrase_energy(p)
+
+        # Low-energy phrases: space notes out more
+        if energy == 'low' and onset_time - last_any_time < 0.20:
+            continue
+
+        # Classify onset as percussive or harmonic
+        f = min(onset_frame, len(harm_rms) - 1, len(perc_rms) - 1)
+        h_e = float(harm_rms[f])
+        p_e = float(perc_rms[f])
+        perc_ratio = p_e / (h_e + p_e + 1e-9)
+        is_percussive = perc_ratio > 0.55
+
+        pidx = phrase_note_count.get(p, 0)
+        if is_percussive:
+            # Percussion → fixed rhythm template (kick/snare feel)
+            preferred = PERC_PATTERN[pidx % len(PERC_PATTERN)]
+        else:
+            # Harmonic → spectral centroid maps to lane (bass=0 … treble=3)
+            preferred = centroid_to_lane(onset_frame)
+
+        # Try preferred lane, then cycle around — skip lanes occupied by a hold
+        chosen = None
+        for offset in range(4):
+            lane = (preferred + offset) % 4
+            if (onset_time - last_lane_time[lane] >= MIN_LANE_GAP
+                    and onset_time >= last_lane_free[lane]):
+                chosen = lane
+                break
+        if chosen is None:
+            continue
+
+        # Hold detection using harmonic RMS sustain
+        hold_dur = 0.0
+        onset_f = min(onset_frame, len(harm_rms) - 1)
+        look_end_t = min(onset_time + 1.6, duration - 0.05)
+        look_end_f = min(
+            int(librosa.time_to_frames(look_end_t, sr=sr, hop_length=HOP)),
+            len(harm_rms) - 1,
+        )
+        if look_end_f > onset_f:
+            onset_e = float(harm_rms[onset_f]) + 1e-9
+            window_rms = harm_rms[onset_f : look_end_f + 1]
+            ratio = window_rms / onset_e
+            drop_idx = np.where(ratio < 0.30)[0]
+            if len(drop_idx):
+                end_f = onset_f + int(drop_idx[0])
+                candidate = (
+                    float(librosa.frames_to_time(end_f, sr=sr, hop_length=HOP))
+                    - onset_time
+                )
+                if candidate >= HOLD_MIN:
+                    hold_dur = candidate
+
+        notes.append({
+            "time": float(onset_time),
+            "lane": int(chosen),
+            "duration": float(hold_dur),
+            "type": "hold" if hold_dur >= HOLD_MIN else "tap",
+        })
+        last_lane_time[chosen] = onset_time
+        if hold_dur >= HOLD_MIN:
+            last_lane_free[chosen] = onset_time + hold_dur + 0.08
+        last_any_time = onset_time
+        phrase_note_count[p] = pidx + 1
+
+        # Chord note on strong beats in high-energy harmonic phrases
+        if energy == 'high' and not is_percussive and hold_dur < HOLD_MIN:
+            if len(beat_times) > 0:
+                nearest_beat_d = float(np.min(np.abs(beat_times - onset_time)))
+                beat_tol = avg_beat * 0.12
+                if nearest_beat_d < beat_tol:
+                    chord_lane = (chosen + 2) % 4  # spread wide across highway
+                    if (onset_time - last_lane_time[chord_lane] >= MIN_LANE_GAP
+                            and onset_time >= last_lane_free[chord_lane]):
+                        notes.append({
+                            "time": float(onset_time),
+                            "lane": int(chord_lane),
+                            "duration": 0.0,
+                            "type": "tap",
+                        })
+                        last_lane_time[chord_lane] = onset_time
+
+    return {"bpm": tempo, "duration": duration, "notes": notes}
+
+
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.route("/static/<path:path>")
+def static_files(path):
+    return send_from_directory("static", path)
+
+
+@app.route("/audio/<video_id>")
+def serve_audio(video_id):
+    # Only alphanumeric + dash/underscore to prevent path traversal
+    if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+        return "Not found", 404
+    mp3_path = os.path.join(CACHE_DIR, f"{video_id}_audio.mp3")
+    if not os.path.exists(mp3_path):
+        return "Not found", 404
+    return send_from_directory(CACHE_DIR, f"{video_id}_audio.mp3")
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.get_json(force=True)
+    url  = (data.get("url")  or "").strip()
+    mode = (data.get("mode") or "original").strip()
+    if mode not in ("original", "vocals", "bass", "drums", "guitar"):
+        mode = "original"
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    video_id = extract_video_id(url)
+    if not video_id:
+        return jsonify({"error": "Could not parse YouTube video ID"}), 400
+
+    # Chart cache is per (video, mode); fallback mp3 is always the original mix
+    chart_cache = os.path.join(CACHE_DIR, f"{video_id}_{mode}.json")
+    mp3_cache   = os.path.join(CACHE_DIR, f"{video_id}_audio.mp3")
+
+    if os.path.exists(chart_cache) and os.path.exists(mp3_cache):
+        with open(chart_cache) as f:
+            return jsonify(json.load(f))
+
+    title, uploader = get_video_title(url)
+
+    audio_base = os.path.join(CACHE_DIR, video_id)
+    try:
+        full_wav = download_audio(url, audio_base)
+    except Exception as e:
+        return jsonify({"error": f"Download failed: {e}"}), 500
+
+    # Build the original-mix mp3 once (shared across all modes for YT-fallback playback)
+    if not os.path.exists(mp3_cache):
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", full_wav, "-q:a", "6", "-ac", "2", mp3_cache],
+                capture_output=True,
+            )
+        except Exception:
+            pass
+
+    # For stem modes: separate with Demucs (stems are cached in cache/{id}_stems/)
+    if mode == "original":
+        analyze_wav = full_wav
+    else:
+        try:
+            analyze_wav = separate_and_get_stem(full_wav, video_id, mode)
+        except Exception as e:
+            try:
+                os.remove(full_wav)
+            except OSError:
+                pass
+            return jsonify({"error": (
+                f"Stem separation failed. Make sure Demucs is installed: "
+                f"pip install demucs — {e}"
+            )}), 500
+
+    try:
+        chart = generate_chart(analyze_wav)
+    except Exception as e:
+        return jsonify({"error": f"Analysis failed: {e}"}), 500
+    finally:
+        # Remove the full-quality WAV; stem WAVs stay cached for subsequent modes
+        try:
+            os.remove(full_wav)
+        except OSError:
+            pass
+
+    chart.update({"videoId": video_id, "title": title, "uploader": uploader, "mode": mode})
+
+    with open(chart_cache, "w") as f:
+        json.dump(chart, f)
+
+    return jsonify(chart)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_ENV") == "development"
+    app.run(host="0.0.0.0", port=port, debug=debug)
