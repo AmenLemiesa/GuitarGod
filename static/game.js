@@ -192,6 +192,9 @@ function applyDifficulty(rawNotes) {
   return out;
 }
 
+// Render API — used only for stem separation (VOCALS/BASS/DRUMS/GUITAR)
+const API_BASE = 'https://guitargod.onrender.com';
+
 // ─── Client-side audio analysis ──────────────────────────────────────────────
 const ANALYSIS_SR  = 16000;
 const ANALYSIS_HOP = 512;
@@ -234,9 +237,8 @@ const MODE_WEIGHTS = {
   guitar:   [0.2, 1.2, 2.0, 1.0],
 };
 
-async function analyzeFile(file, mode = 'original') {
+async function analyzeFile(arrayBuffer, mode = 'original') {
   setStatus('DECODING AUDIO…');
-  const arrayBuffer = await file.arrayBuffer();
   const initCtx = new AudioContext();
   const fullBuffer = await initCtx.decodeAudioData(arrayBuffer);
   await initCtx.close();
@@ -393,8 +395,9 @@ function setFile(file) {
   $('shred-btn').disabled = false;
 }
 
-fileInput.addEventListener('change', e => setFile(e.target.files[0]));
-dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('click',     ()  => fileInput.click());
+fileInput.addEventListener('change',   e   => setFile(e.target.files[0]));
+dropZone.addEventListener('dragover',  e   => { e.preventDefault(); dropZone.classList.add('drag-over'); });
 dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
@@ -411,16 +414,43 @@ async function onSubmitFile(file) {
   state = 'loading';
   $('shred-btn').disabled = true;
 
-  let chartData;
+  const title = file.name.replace(/\.[^.]+$/, '');
+  let chartData, audioUrl;
+
   try {
-    chartData = await analyzeFile(file, currentMode);
+    if (currentMode === 'original') {
+      // Fully client-side
+      const arrayBuffer = await file.arrayBuffer();
+      chartData = await analyzeFile(arrayBuffer, 'original');
+      audioUrl  = URL.createObjectURL(file);
+    } else {
+      // Stem separation via Render API → analyze stem client-side
+      setStatus('SEPARATING STEMS — MAY TAKE A MINUTE…');
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('mode', currentMode);
+      let res;
+      try {
+        res = await fetch(`${API_BASE}/separate`, { method: 'POST', body: fd });
+      } catch {
+        setStatus('STEM SERVER UNREACHABLE');
+        goIdle(); return;
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setStatus(`ERROR: ${(err.error || 'STEM FAILED').toUpperCase()}`);
+        goIdle(); return;
+      }
+      const { audioId } = await res.json();
+      audioUrl = `${API_BASE}/audio/${audioId}`;
+      const stemBuffer = await fetch(audioUrl).then(r => r.arrayBuffer());
+      chartData = await analyzeFile(stemBuffer, currentMode);
+    }
   } catch(e) {
     setStatus(`ERROR: ${String(e).toUpperCase().slice(0, 80)}`);
     goIdle(); return;
   }
 
-  const audioUrl = URL.createObjectURL(file);
-  const title    = file.name.replace(/\.[^.]+$/, '');
   chart = { ...chartData, audioUrl, title, uploader: '', mode: currentMode };
   setStatus(`${applyDifficulty(chart.notes).length} NOTES — LOADING`);
   await beginGame(false);

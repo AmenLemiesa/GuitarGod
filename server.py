@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,48 @@ import numpy as np
 
 app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150 MB upload limit
+
+@app.after_request
+def cors(r):
+    r.headers["Access-Control-Allow-Origin"]  = "*"
+    r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return r
+
+@app.route("/separate", methods=["OPTIONS"])
+def separate_preflight():
+    return "", 204
+
+STEM_NAMES = {"vocals": "vocals", "bass": "bass", "drums": "drums", "guitar": "other"}
+
+def separate_and_get_stem(full_wav, work_dir, mode):
+    stem_file = STEM_NAMES[mode]
+    stems_dir = os.path.join(work_dir, "stems")
+    target    = os.path.join(stems_dir, f"{stem_file}.wav")
+    if os.path.exists(target):
+        return target
+    os.makedirs(stems_dir, exist_ok=True)
+    tmp_out = os.path.join(work_dir, "dtmp")
+    track   = os.path.splitext(os.path.basename(full_wav))[0]
+    result  = subprocess.run(
+        [sys.executable, "-m", "demucs", "-n", "htdemucs",
+         "--segment", "7.8", "--overlap", "0.1",
+         "--out", tmp_out, full_wav],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "")[-600:].strip()
+        raise RuntimeError(detail or f"exit code {result.returncode}")
+    src_base = os.path.join(tmp_out, "htdemucs", track)
+    for sn in STEM_NAMES.values():
+        src = os.path.join(src_base, f"{sn}.wav")
+        dst = os.path.join(stems_dir, f"{sn}.wav")
+        if os.path.exists(src) and not os.path.exists(dst):
+            os.rename(src, dst)
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    if not os.path.exists(target):
+        raise FileNotFoundError(f"Demucs did not produce {stem_file}.wav")
+    return target
 
 # In-memory registry of short-lived fallback audio files: audio_id -> filepath
 _audio_store: dict = {}
@@ -335,6 +378,61 @@ def analyze():
         "mode": mode,
     })
     return jsonify(chart)
+
+
+@app.route("/separate", methods=["POST"])
+def separate():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "No file selected"}), 400
+
+    mode = (request.form.get("mode") or "").strip()
+    if mode not in STEM_NAMES:
+        return jsonify({"error": "Invalid mode"}), 400
+
+    work_dir = tempfile.mkdtemp(prefix="guitargod_sep_")
+    audio_id = str(uuid.uuid4())
+    mp3_path = os.path.join(work_dir, f"{audio_id}.mp3")
+
+    try:
+        ext = os.path.splitext(f.filename)[1].lower() if f.filename else ".bin"
+        uploaded_path = os.path.join(work_dir, f"upload{ext}")
+        f.save(uploaded_path)
+
+        wav_path = os.path.join(work_dir, "audio.wav")
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-i", uploaded_path, "-t", str(MAX_DURATION), wav_path],
+            capture_output=True,
+        )
+        if res.returncode != 0 or not os.path.exists(wav_path):
+            return jsonify({"error": "Could not decode audio file"}), 400
+
+        try:
+            stem_wav = separate_and_get_stem(wav_path, work_dir, mode)
+        except Exception as e:
+            return jsonify({"error": f"Stem separation failed: {e}"}), 500
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", stem_wav, "-q:a", "4", "-ac", "2", mp3_path],
+            capture_output=True,
+        )
+
+    finally:
+        final_mp3 = os.path.join(tempfile.gettempdir(), f"guitargod_{audio_id}.mp3")
+        if os.path.exists(mp3_path):
+            shutil.move(mp3_path, final_mp3)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    if not os.path.exists(final_mp3):
+        return jsonify({"error": "Stem audio not produced"}), 500
+
+    with _audio_lock:
+        _audio_store[audio_id] = final_mp3
+    _schedule_audio_cleanup(audio_id, final_mp3, delay=7200)
+
+    return jsonify({"audioId": audio_id})
 
 
 if __name__ == "__main__":
