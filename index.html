@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Guitar God</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Oswald:wght@200;400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="static/style.css" />
+</head>
+<body>
+
+  <!-- START -->
+  <div id="screen-start" class="screen active">
+    <canvas id="bg-canvas"></canvas>
+    <div class="start-content">
+      <div class="start-logo">
+        <div class="logo-eyebrow">— GUITAR —</div>
+        <div class="logo-main">GOD</div>
+        <div class="logo-sub">drop a track. ascend.</div>
+      </div>
+
+      <div class="start-input-wrap">
+        <div class="input-label">AUDIO FILE</div>
+        <div class="drop-zone" id="drop-zone">
+          <input type="file" id="file-input" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac,.opus,.mp4" />
+          <div class="drop-zone-inner">
+            <div class="drop-zone-icon">♪</div>
+            <div class="drop-zone-text" id="drop-zone-text">DROP FILE HERE</div>
+            <div class="drop-zone-sub">click to browse · mp3, wav, m4a, ogg…</div>
+          </div>
+        </div>
+        <button id="shred-btn" disabled>SHRED</button>
+        <div id="status-msg"></div>
+      </div>
+
+      <div class="diff-wrap">
+        <div class="input-label">DIFFICULTY</div>
+        <div class="diff-row">
+          <button class="diff-btn" data-diff="easy">EASY</button>
+          <button class="diff-btn diff-btn-active" data-diff="medium">MEDIUM</button>
+          <button class="diff-btn" data-diff="hard">HARD</button>
+          <button class="diff-btn diff-btn-extreme" data-diff="extreme">EXTREME</button>
+        </div>
+      </div>
+
+      <div class="start-controls">
+        <div class="controls-keys">
+          <div class="ctrl-key" data-i="0">D</div>
+          <div class="ctrl-key" data-i="1">F</div>
+          <div class="ctrl-key" data-i="2">J</div>
+          <div class="ctrl-key" data-i="3">K</div>
+        </div>
+        <div class="controls-hint">tap keys to hit notes as they reach the strike line</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GAME -->
+  <div id="screen-game" class="screen">
+    <div id="hud">
+      <div class="hud-stat">
+        <div class="hud-label">SCORE</div>
+        <div class="hud-score-row">
+          <div class="hud-val" id="score-val">0000000</div>
+          <div class="hud-mult" id="mult-val">×1</div>
+        </div>
+      </div>
+      <div class="hud-center">
+        <div id="song-title-hud"></div>
+      </div>
+      <div class="hud-stat hud-stat-right">
+        <div class="hud-label">FAITH</div>
+        <div class="health-bar">
+          <div id="health-fill"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="game-layout">
+      <div id="side-panel">
+        <div id="now-playing">
+          <div id="np-title"></div>
+          <div id="np-artist"></div>
+        </div>
+        <div id="combo-block">
+          <div id="combo-val">×0</div>
+          <div class="hud-label">COMBO</div>
+        </div>
+      </div>
+
+      <div id="highway-col">
+        <canvas id="highway"></canvas>
+        <div id="strike-keys">
+          <div class="skey" id="skey-d">D</div>
+          <div class="skey" id="skey-f">F</div>
+          <div class="skey" id="skey-j">J</div>
+          <div class="skey" id="skey-k">K</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="judgment"></div>
+    <div id="miss-vignette"></div>
+  </div>
+
+  <!-- RESULT -->
+  <div id="screen-result" class="screen">
+    <div class="result-content">
+      <div id="result-headline">ASCENDED</div>
+      <div id="result-song"></div>
+      <div class="result-row">
+        <div class="result-stat">
+          <div class="rs-val" id="r-score">0000000</div>
+          <div class="rs-label">SCORE</div>
+        </div>
+        <div class="rs-divider"></div>
+        <div class="result-stat">
+          <div class="rs-val" id="r-combo">×0</div>
+          <div class="rs-label">MAX COMBO</div>
+        </div>
+        <div class="rs-divider"></div>
+        <div class="result-stat">
+          <div class="rs-val" id="r-acc">0%</div>
+          <div class="rs-label">ACCURACY</div>
+        </div>
+      </div>
+      <div class="result-pills">
+        <span class="rpill rpill-p" id="r-perfect">0 PERFECT</span>
+        <span class="rpill rpill-g" id="r-good">0 GOOD</span>
+        <span class="rpill rpill-m" id="r-miss">0 MISS</span>
+      </div>
+      <div class="result-btns">
+        <button id="play-again-btn">PLAY AGAIN</button>
+        <button id="new-song-btn">NEW SONG</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- COUNTDOWN -->
+  <div id="countdown-overlay">
+    <div id="countdown-num"></div>
+  </div>
+
+  <script src="static/game.js"></script>
+</body>
+</html>

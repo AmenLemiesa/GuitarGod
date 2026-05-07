@@ -31,7 +31,6 @@ const CFG = {
 let state = 'idle';
 let chart = null;
 let currentDifficulty = 'medium';
-let currentMode = 'original';
 let dyingTs = null;    // performance.now() when health first hit 0
 let winningTs = null;  // performance.now() when all notes settled
 let gameWallStart = 0; // performance.now() when the game loop started
@@ -168,14 +167,6 @@ document.querySelectorAll('.diff-btn').forEach(btn => {
   });
 });
 
-document.querySelectorAll('.mode-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('mode-btn-active'));
-    btn.classList.add('mode-btn-active');
-    currentMode = btn.dataset.mode;
-  });
-});
-
 function applyDifficulty(rawNotes) {
   // Hard and extreme get all notes; extreme is just punishing on health
   if (currentDifficulty === 'hard' || currentDifficulty === 'extreme') return rawNotes;
@@ -190,6 +181,178 @@ function applyDifficulty(rawNotes) {
     lastTime = n.time;
   }
   return out;
+}
+
+// ─── Client-side audio analysis ──────────────────────────────────────────────
+const ANALYSIS_SR  = 16000;
+const ANALYSIS_HOP = 512;
+const MAX_ANALYSIS_SECS = 300; // 5 min cap
+
+async function renderBandEnergy(audioBuffer, loHz, hiHz) {
+  const sr  = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(1, audioBuffer.length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+  const hi = ctx.createBiquadFilter();
+  hi.type = 'highpass'; hi.frequency.value = loHz; hi.Q.value = 0.707;
+  const lo = ctx.createBiquadFilter();
+  lo.type = 'lowpass';  lo.frequency.value = Math.min(hiHz, sr / 2 - 1); lo.Q.value = 0.707;
+  src.connect(hi); hi.connect(lo); lo.connect(ctx.destination);
+  src.start();
+  return ctx.startRendering();
+}
+
+function estimateBPM(onsetEnv, fps) {
+  const minLag = Math.round(fps * 60 / 200);
+  const maxLag = Math.round(fps * 60 / 60);
+  let bestLag = minLag, bestCorr = -Infinity;
+  const n = onsetEnv.length;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let c = 0;
+    for (let i = 0; i < n - lag; i++) c += onsetEnv[i] * onsetEnv[i + lag];
+    if (c > bestCorr) { bestCorr = c; bestLag = lag; }
+  }
+  return 60 * fps / bestLag;
+}
+
+async function analyzeFile(file) {
+  setStatus('DECODING AUDIO…');
+  const arrayBuffer = await file.arrayBuffer();
+  const initCtx = new AudioContext();
+  const fullBuffer = await initCtx.decodeAudioData(arrayBuffer);
+  await initCtx.close();
+
+  // Resample to ANALYSIS_SR and trim to MAX_ANALYSIS_SECS (mono)
+  const targetSamples = Math.min(
+    Math.floor(fullBuffer.duration * ANALYSIS_SR),
+    ANALYSIS_SR * MAX_ANALYSIS_SECS
+  );
+  const offCtx = new OfflineAudioContext(1, targetSamples, ANALYSIS_SR);
+  const src = offCtx.createBufferSource();
+  src.buffer = fullBuffer;
+  src.connect(offCtx.destination);
+  src.start();
+  const mono = await offCtx.startRendering();
+
+  const data = mono.getChannelData(0);
+  const sr   = ANALYSIS_SR;
+  const hop  = ANALYSIS_HOP;
+  const fps  = sr / hop;
+  const duration = mono.duration;
+  const numFrames = Math.floor(data.length / hop);
+
+  // Per-frame RMS (noise gate)
+  const rms = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) {
+    let sum = 0;
+    const s = i * hop, e = Math.min(s + hop, data.length);
+    for (let j = s; j < e; j++) sum += data[j] * data[j];
+    rms[i] = Math.sqrt(sum / (e - s));
+  }
+  const rmsMax = Math.max.apply(null, rms) + 1e-9;
+
+  // Four frequency bands → four lanes
+  setStatus('ANALYZING FREQUENCIES…');
+  const bandDefs = [[40,250],[250,1000],[1000,4000],[4000,7500]];
+  const bandRms = await Promise.all(bandDefs.map(async ([lo, hi]) => {
+    const buf = await renderBandEnergy(mono, lo, hi);
+    const ch  = buf.getChannelData(0);
+    const fr  = new Float32Array(numFrames);
+    for (let i = 0; i < numFrames; i++) {
+      let sum = 0;
+      const s = i * hop, e = Math.min(s + hop, ch.length);
+      for (let j = s; j < e; j++) sum += ch[j] * ch[j];
+      fr[i] = Math.sqrt(sum / (e - s));
+    }
+    return fr;
+  }));
+
+  // Onset envelope = positive spectral flux summed across bands
+  const onsetEnv = new Float32Array(numFrames);
+  for (let b = 0; b < 4; b++) {
+    const br = bandRms[b];
+    for (let i = 1; i < numFrames; i++) {
+      const d = br[i] - br[i - 1];
+      if (d > 0) onsetEnv[i] += d;
+    }
+  }
+
+  const bpm = estimateBPM(onsetEnv, fps);
+
+  // Adaptive threshold peak picking
+  setStatus('DETECTING ONSETS…');
+  const winFrames = Math.round(0.3 * fps);
+  const adaptive  = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) {
+    let sum = 0, cnt = 0;
+    const a = Math.max(0, i - winFrames), b2 = Math.min(numFrames - 1, i + winFrames);
+    for (let j = a; j <= b2; j++) { sum += onsetEnv[j]; cnt++; }
+    adaptive[i] = sum / cnt;
+  }
+
+  const NOISE_GATE = 0.06;
+  const MIN_GAP    = Math.round(0.08 * fps);
+  const onsetFrames = [];
+  let lastPick = -MIN_GAP;
+  for (let i = 1; i < numFrames - 1; i++) {
+    if (onsetEnv[i] > adaptive[i] * 1.3 &&
+        onsetEnv[i] > onsetEnv[i - 1] &&
+        onsetEnv[i] >= onsetEnv[i + 1] &&
+        rms[i] / rmsMax >= NOISE_GATE &&
+        i - lastPick >= MIN_GAP) {
+      onsetFrames.push(i);
+      lastPick = i;
+    }
+  }
+
+  // 50th-percentile strength threshold
+  const sorted = onsetFrames.map(f => onsetEnv[f]).sort((a, b) => a - b);
+  const strengthThresh = sorted[Math.floor(sorted.length * 0.5)] || 0;
+
+  // Build note chart
+  setStatus('MAPPING NOTES…');
+  const notes = [];
+  const lastLaneTime = [-999, -999, -999, -999];
+  let lastAnyTime = -999;
+  const HOLD_MIN = 0.30;
+
+  for (const f of onsetFrames) {
+    const time = f * hop / sr;
+    if (onsetEnv[f] < strengthThresh) continue;
+    if (time - lastAnyTime < 0.04) continue;
+
+    // Dominant band → preferred lane
+    let preferred = 0, maxE = -1;
+    for (let b = 0; b < 4; b++) {
+      if (bandRms[b][f] > maxE) { maxE = bandRms[b][f]; preferred = b; }
+    }
+
+    let chosen = null;
+    for (let off = 0; off < 4; off++) {
+      const lane = (preferred + off) % 4;
+      if (time - lastLaneTime[lane] >= 0.10) { chosen = lane; break; }
+    }
+    if (chosen === null) continue;
+
+    // Hold: check how long dominant band energy sustains
+    let holdDur = 0;
+    const db = bandRms[preferred];
+    const oe = db[f] + 1e-9;
+    const lookEnd = Math.min(f + Math.round(1.6 * fps), numFrames - 1);
+    for (let k = f + 1; k <= lookEnd; k++) {
+      if (db[k] / oe < 0.30) {
+        const cand = (k - f) * hop / sr;
+        if (cand >= HOLD_MIN) holdDur = cand;
+        break;
+      }
+    }
+
+    notes.push({ time, lane: chosen, duration: holdDur, type: holdDur >= HOLD_MIN ? 'hold' : 'tap' });
+    lastLaneTime[chosen] = time + (holdDur >= HOLD_MIN ? holdDur + 0.08 : 0);
+    lastAnyTime = time;
+  }
+
+  return { bpm, duration, notes };
 }
 
 // ─── Load flow (from start screen) ───────────────────────────────────────────
@@ -224,29 +387,18 @@ async function onSubmitFile(file) {
   if (!file || state === 'loading') return;
   state = 'loading';
   $('shred-btn').disabled = true;
-  setStatus(currentMode === 'original'
-    ? 'ANALYZING…'
-    : 'SEPARATING STEMS — MAY TAKE 3–10 MIN FIRST TIME…');
 
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('mode', currentMode);
-
-  let res;
+  let chartData;
   try {
-    res = await fetch('/analyze', { method: 'POST', body: fd });
-  } catch {
-    setStatus('SERVER UNREACHABLE — IS IT RUNNING?');
+    chartData = await analyzeFile(file);
+  } catch(e) {
+    setStatus(`ERROR: ${String(e).toUpperCase().slice(0, 80)}`);
     goIdle(); return;
   }
 
-  if (!res.ok) {
-    const err = await res.json().catch(()=>({}));
-    setStatus(`ERROR: ${(err.error||'UNKNOWN').toUpperCase()}`);
-    goIdle(); return;
-  }
-
-  chart = await res.json();
+  const audioUrl = URL.createObjectURL(file);
+  const title    = file.name.replace(/\.[^.]+$/, '');
+  chart = { ...chartData, audioUrl, title, uploader: '' };
   setStatus(`${applyDifficulty(chart.notes).length} NOTES — LOADING`);
   await beginGame(false);
 }
@@ -305,8 +457,7 @@ async function beginGame(isReplay) {
   CFG.LANE_W    = Math.floor(canvas.width / CFG.LANE_COUNT);
   $('strike-keys').style.width = canvas.width + 'px';
 
-  // Set up audio element
-  audioEl = new Audio(`/audio/${chart.audioId}`);
+  audioEl = new Audio(chart.audioUrl);
   audioEl.onended = () => { if (state === 'playing') beginWinning(0); };
 
   state = 'countdown';
