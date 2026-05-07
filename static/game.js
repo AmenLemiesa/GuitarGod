@@ -443,7 +443,7 @@ async function onSubmitFile(file) {
         goIdle(); return;
       }
       const stemBlob = await res.blob();
-      audioUrl = URL.createObjectURL(stemBlob);
+      audioUrl = URL.createObjectURL(file);
       const stemBuffer = await stemBlob.arrayBuffer();
       chartData = await analyzeFile(stemBuffer, currentMode);
     }
