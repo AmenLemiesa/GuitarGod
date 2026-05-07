@@ -158,8 +158,9 @@ function spawnAudioFallback(videoId) {
     img.style.cssText = 'width:240px;height:135px;object-fit:cover;display:block;';
     box.appendChild(img);
   }
-  // Fresh audio element every game (so seeking works cleanly)
-  audioEl = new Audio(`/audio/${videoId}`);
+  // Use the session-unique audioId from the chart (not the videoId)
+  const audioUrl = chart.audioId ? `/audio/${chart.audioId}` : `/audio/${videoId}`;
+  audioEl = new Audio(audioUrl);
   audioEl.onended = () => { if (state==='playing') beginWinning(0); };
 }
 

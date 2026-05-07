@@ -4,11 +4,5 @@ services:
     runtime: docker
     plan: free
     envVars:
-      - key: CACHE_DIR
-        value: /data/cache
       - key: FLASK_ENV
         value: production
-    disk:
-      name: cache
-      mountPath: /data/cache
-      sizeGB: 1

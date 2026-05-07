@@ -5,15 +5,33 @@ import json
 import sys
 import shutil
 import subprocess
+import tempfile
+import threading
+import time
+import uuid
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 import yt_dlp
 import librosa
 import numpy as np
 
 app = Flask(__name__, static_folder="static")
-CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
+
+# In-memory registry of short-lived fallback audio files: audio_id -> filepath
+_audio_store: dict = {}
+_audio_lock = threading.Lock()
+
+def _schedule_audio_cleanup(audio_id: str, path: str, delay: int = 7200):
+    """Delete a temp mp3 file after `delay` seconds (default 2 h)."""
+    def _run():
+        time.sleep(delay)
+        with _audio_lock:
+            _audio_store.pop(audio_id, None)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def extract_video_id(url):
@@ -77,16 +95,15 @@ def download_audio(url, base_path):
 
 STEM_NAMES = {'vocals': 'vocals', 'bass': 'bass', 'drums': 'drums', 'guitar': 'other'}
 
-def separate_and_get_stem(full_wav, video_id, mode):
-    """Run Demucs on full_wav and return the path to the requested stem WAV.
-    Stems are cached in cache/{video_id}_stems/ for reuse across modes."""
+def separate_and_get_stem(full_wav, work_dir, mode):
+    """Run Demucs on full_wav inside work_dir and return the path to the stem WAV."""
     stem_file = STEM_NAMES[mode]
-    stems_dir = os.path.join(CACHE_DIR, f"{video_id}_stems")
+    stems_dir = os.path.join(work_dir, "stems")
     target = os.path.join(stems_dir, f"{stem_file}.wav")
     if os.path.exists(target):
         return target
     os.makedirs(stems_dir, exist_ok=True)
-    tmp_out = os.path.join(CACHE_DIR, f"{video_id}_dtmp")
+    tmp_out = os.path.join(work_dir, "dtmp")
     track = os.path.splitext(os.path.basename(full_wav))[0]
     result = subprocess.run(
         [sys.executable, "-m", "demucs", "-n", "htdemucs",
@@ -329,15 +346,16 @@ def static_files(path):
     return send_from_directory("static", path)
 
 
-@app.route("/audio/<video_id>")
-def serve_audio(video_id):
-    # Only alphanumeric + dash/underscore to prevent path traversal
-    if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+@app.route("/audio/<audio_id>")
+def serve_audio(audio_id):
+    # UUID format only — prevents path traversal
+    if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', audio_id):
         return "Not found", 404
-    mp3_path = os.path.join(CACHE_DIR, f"{video_id}_audio.mp3")
-    if not os.path.exists(mp3_path):
+    with _audio_lock:
+        path = _audio_store.get(audio_id)
+    if not path or not os.path.exists(path):
         return "Not found", 404
-    return send_from_directory(CACHE_DIR, f"{video_id}_audio.mp3")
+    return send_file(path, mimetype="audio/mpeg")
 
 
 @app.route("/analyze", methods=["POST"])
@@ -354,64 +372,66 @@ def analyze():
     if not video_id:
         return jsonify({"error": "Could not parse YouTube video ID"}), 400
 
-    # Chart cache is per (video, mode); fallback mp3 is always the original mix
-    chart_cache = os.path.join(CACHE_DIR, f"{video_id}_{mode}.json")
-    mp3_cache   = os.path.join(CACHE_DIR, f"{video_id}_audio.mp3")
-
-    if os.path.exists(chart_cache) and os.path.exists(mp3_cache):
-        with open(chart_cache) as f:
-            return jsonify(json.load(f))
-
     title, uploader = get_video_title(url)
 
-    audio_base = os.path.join(CACHE_DIR, video_id)
-    try:
-        full_wav = download_audio(url, audio_base)
-    except Exception as e:
-        return jsonify({"error": f"Download failed: {e}"}), 500
+    # Every request gets its own temp directory — nothing is shared between sessions
+    work_dir = tempfile.mkdtemp(prefix="guitargod_")
+    audio_id = str(uuid.uuid4())
+    mp3_path = os.path.join(work_dir, f"{audio_id}.mp3")
 
-    # Build the original-mix mp3 once (shared across all modes for YT-fallback playback)
-    if not os.path.exists(mp3_cache):
+    try:
+        audio_base = os.path.join(work_dir, video_id)
+        try:
+            full_wav = download_audio(url, audio_base)
+        except Exception as e:
+            return jsonify({"error": f"Download failed: {e}"}), 500
+
+        # Fallback mp3 for when YouTube embedding is blocked
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-i", full_wav, "-q:a", "6", "-ac", "2", mp3_cache],
+                ["ffmpeg", "-y", "-i", full_wav, "-q:a", "6", "-ac", "2", mp3_path],
                 capture_output=True,
             )
         except Exception:
             pass
 
-    # For stem modes: separate with Demucs (stems are cached in cache/{id}_stems/)
-    if mode == "original":
-        analyze_wav = full_wav
-    else:
-        try:
-            analyze_wav = separate_and_get_stem(full_wav, video_id, mode)
-        except Exception as e:
+        # Stem separation if needed
+        if mode == "original":
+            analyze_wav = full_wav
+        else:
             try:
-                os.remove(full_wav)
-            except OSError:
-                pass
-            return jsonify({"error": (
-                f"Stem separation failed. Make sure Demucs is installed: "
-                f"pip install demucs — {e}"
-            )}), 500
+                analyze_wav = separate_and_get_stem(full_wav, work_dir, mode)
+            except Exception as e:
+                return jsonify({"error": (
+                    f"Stem separation failed. Make sure Demucs is installed: "
+                    f"pip install demucs — {e}"
+                )}), 500
 
-    try:
-        chart = generate_chart(analyze_wav)
-    except Exception as e:
-        return jsonify({"error": f"Analysis failed: {e}"}), 500
-    finally:
-        # Remove the full-quality WAV; stem WAVs stay cached for subsequent modes
         try:
-            os.remove(full_wav)
-        except OSError:
-            pass
+            chart = generate_chart(analyze_wav)
+        except Exception as e:
+            return jsonify({"error": f"Analysis failed: {e}"}), 500
 
-    chart.update({"videoId": video_id, "title": title, "uploader": uploader, "mode": mode})
+    finally:
+        # Move the mp3 out before nuking the work dir
+        final_mp3 = os.path.join(tempfile.gettempdir(), f"guitargod_{audio_id}.mp3")
+        if os.path.exists(mp3_path):
+            shutil.move(mp3_path, final_mp3)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
-    with open(chart_cache, "w") as f:
-        json.dump(chart, f)
+    # Register fallback audio — auto-deletes after 2 hours
+    if os.path.exists(final_mp3):
+        with _audio_lock:
+            _audio_store[audio_id] = final_mp3
+        _schedule_audio_cleanup(audio_id, final_mp3, delay=7200)
 
+    chart.update({
+        "videoId": video_id,
+        "audioId": audio_id,
+        "title": title,
+        "uploader": uploader,
+        "mode": mode,
+    })
     return jsonify(chart)
 
 
