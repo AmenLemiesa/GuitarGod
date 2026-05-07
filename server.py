@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import re
-import sys
 import shutil
 import subprocess
 import tempfile
@@ -33,43 +32,15 @@ def _schedule_audio_cleanup(audio_id: str, path: str, delay: int = 7200):
     threading.Thread(target=_run, daemon=True).start()
 
 
-STEM_NAMES = {'vocals': 'vocals', 'bass': 'bass', 'drums': 'drums', 'guitar': 'other'}
 
-def separate_and_get_stem(full_wav, work_dir, mode):
-    """Run Demucs on full_wav inside work_dir and return the path to the stem WAV."""
-    stem_file = STEM_NAMES[mode]
-    stems_dir = os.path.join(work_dir, "stems")
-    target = os.path.join(stems_dir, f"{stem_file}.wav")
-    if os.path.exists(target):
-        return target
-    os.makedirs(stems_dir, exist_ok=True)
-    tmp_out = os.path.join(work_dir, "dtmp")
-    track = os.path.splitext(os.path.basename(full_wav))[0]
-    result = subprocess.run(
-        [sys.executable, "-m", "demucs", "-n", "htdemucs",
-         "--out", tmp_out, full_wav],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "")[-600:].strip()
-        raise RuntimeError(detail or f"exit code {result.returncode}")
-    src_base = os.path.join(tmp_out, "htdemucs", track)
-    for sn in STEM_NAMES.values():
-        src = os.path.join(src_base, f"{sn}.wav")
-        dst = os.path.join(stems_dir, f"{sn}.wav")
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.rename(src, dst)
-    shutil.rmtree(tmp_out, ignore_errors=True)
-    if not os.path.exists(target):
-        raise FileNotFoundError(f"Demucs did not produce {stem_file}.wav")
-    return target
 
+MAX_DURATION = 300  # 5 minutes — keeps peak memory under ~250 MB
 
 def generate_chart(audio_path):
-    SR = 22050
+    SR = 16000
     HOP = 512
 
-    y, sr = librosa.load(audio_path, sr=SR, mono=True)
+    y, sr = librosa.load(audio_path, sr=SR, mono=True, duration=MAX_DURATION)
     duration = float(librosa.get_duration(y=y, sr=sr))
 
     # Beat tracking
@@ -321,9 +292,13 @@ def analyze():
         uploaded_path = os.path.join(work_dir, f"upload{ext}")
         f.save(uploaded_path)
 
+        if mode != "original":
+            return jsonify({"error": "Stem modes require a paid server upgrade — use ORIGINAL mode"}), 400
+
         wav_path = os.path.join(work_dir, "audio.wav")
+        # Truncate to MAX_DURATION seconds during conversion to keep memory bounded
         res = subprocess.run(
-            ["ffmpeg", "-y", "-i", uploaded_path, wav_path],
+            ["ffmpeg", "-y", "-i", uploaded_path, "-t", str(MAX_DURATION), wav_path],
             capture_output=True,
         )
         if res.returncode != 0 or not os.path.exists(wav_path):
@@ -335,13 +310,7 @@ def analyze():
             capture_output=True,
         )
 
-        if mode == "original":
-            analyze_wav = full_wav
-        else:
-            try:
-                analyze_wav = separate_and_get_stem(full_wav, work_dir, mode)
-            except Exception as e:
-                return jsonify({"error": f"Stem separation failed: {e}"}), 500
+        analyze_wav = full_wav
 
         try:
             chart = generate_chart(analyze_wav)

@@ -18,4 +18,4 @@ RUN mkdir -p /data/cache
 
 EXPOSE 8000
 
-CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "600", "--keep-alive", "5"]
+CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "600", "--keep-alive", "5"]
