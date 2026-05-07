@@ -192,8 +192,9 @@ function applyDifficulty(rawNotes) {
   return out;
 }
 
-// Render API — used only for stem separation (VOCALS/BASS/DRUMS/GUITAR)
-const API_BASE = 'https://guitargod.onrender.com';
+// Hugging Face Space API — used only for stem separation (VOCALS/BASS/DRUMS/GUITAR)
+// Update this URL after creating your HF Space: https://huggingface.co/spaces/YOUR_USERNAME/guitargod-stems
+const API_BASE = 'https://NotAmen-guitargod-stems.hf.space';
 
 // ─── Client-side audio analysis ──────────────────────────────────────────────
 const ANALYSIS_SR  = 16000;
@@ -441,9 +442,9 @@ async function onSubmitFile(file) {
         setStatus(`ERROR: ${(err.error || 'STEM FAILED').toUpperCase()}`);
         goIdle(); return;
       }
-      const { audioId } = await res.json();
-      audioUrl = `${API_BASE}/audio/${audioId}`;
-      const stemBuffer = await fetch(audioUrl).then(r => r.arrayBuffer());
+      const stemBlob = await res.blob();
+      audioUrl = URL.createObjectURL(stemBlob);
+      const stemBuffer = await stemBlob.arrayBuffer();
       chartData = await analyzeFile(stemBuffer, currentMode);
     }
   } catch(e) {
