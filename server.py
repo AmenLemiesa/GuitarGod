@@ -35,25 +35,42 @@ def _schedule_audio_cleanup(audio_id: str, path: str, delay: int = 7200):
 
 
 def _yt_opts_base():
-    """Base yt-dlp options, injecting cookies from env var when running on a server."""
-    opts = {"quiet": True, "no_warnings": True}
-    cookies = os.environ.get("YT_COOKIES", "").strip()
-    if cookies:
-        # Write cookies to a temp file for this call; caller is responsible for cleanup
-        tf = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix="ytc_")
-        tf.write(cookies)
-        tf.close()
-        opts["cookiefile"] = tf.name
-    return opts
+    return {"quiet": True, "no_warnings": True}
 
 
-def _cleanup_cookiefile(opts):
-    path = opts.get("cookiefile")
-    if path:
+# Public Piped API instances (open YouTube proxy, no auth, works from any IP)
+_PIPED_INSTANCES = [
+    "pipedapi.kavin.rocks",
+    "piped.smnz.de",
+    "api.piped.yt",
+]
+
+
+def _piped_download(video_id, base_path):
+    """Download best audio via Piped API — no bot detection, works from datacenters."""
+    import urllib.request
+    wav = base_path + ".wav"
+    for host in _PIPED_INSTANCES:
         try:
-            os.unlink(path)
-        except OSError:
-            pass
+            req = urllib.request.Request(
+                f"https://{host}/streams/{video_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            streams = [s for s in data.get("audioStreams", []) if s.get("url")]
+            if not streams:
+                continue
+            best = max(streams, key=lambda s: s.get("bitrate", 0))
+            res = subprocess.run(
+                ["ffmpeg", "-y", "-i", best["url"], wav],
+                capture_output=True, timeout=180,
+            )
+            if res.returncode == 0 and os.path.exists(wav):
+                return wav
+        except Exception:
+            continue
+    return None
 
 
 def extract_video_id(url):
@@ -70,30 +87,50 @@ def extract_video_id(url):
 def get_video_title(url):
     opts = _yt_opts_base()
     opts["skip_download"] = True
+    opts["extractor_args"] = {"youtube": {"player_client": ["tv_embedded", "ios"]}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return info.get("title", "Unknown"), info.get("uploader", "")
     except Exception:
-        return "Unknown", ""
-    finally:
-        _cleanup_cookiefile(opts)
+        pass
+    # Piped fallback for title
+    video_id = extract_video_id(url)
+    if video_id:
+        import urllib.request
+        for host in _PIPED_INSTANCES:
+            try:
+                req = urllib.request.Request(
+                    f"https://{host}/streams/{video_id}",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read())
+                title = data.get("title") or "Unknown"
+                uploader = data.get("uploader") or ""
+                return title, uploader
+            except Exception:
+                continue
+    return "Unknown", ""
 
 
 def download_audio(url, base_path):
+    wav = base_path + ".wav"
+
+    # Layer 1: yt-dlp with tv_embedded + ios clients (bypass datacenter bot detection)
     opts = _yt_opts_base()
     opts.update({
         "format": "bestaudio/best",
         "outtmpl": base_path + ".%(ext)s",
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios"]}},
     })
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
-    finally:
-        _cleanup_cookiefile(opts)
+    except Exception:
+        pass
 
-    wav = base_path + ".wav"
     if os.path.exists(wav):
         return wav
 
@@ -101,16 +138,20 @@ def download_audio(url, base_path):
     for ext in ["m4a", "webm", "mp3", "ogg", "opus"]:
         src = base_path + "." + ext
         if os.path.exists(src):
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", src, wav],
-                capture_output=True,
-            )
+            subprocess.run(["ffmpeg", "-y", "-i", src, wav], capture_output=True)
             try:
                 os.remove(src)
             except OSError:
                 pass
             if os.path.exists(wav):
                 return wav
+
+    # Layer 2: Piped API (open YouTube proxy, no bot detection)
+    video_id = extract_video_id(url)
+    if video_id:
+        result = _piped_download(video_id, base_path)
+        if result:
+            return result
 
     raise FileNotFoundError(f"Could not produce WAV from {url}")
 
