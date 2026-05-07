@@ -34,6 +34,28 @@ def _schedule_audio_cleanup(audio_id: str, path: str, delay: int = 7200):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _yt_opts_base():
+    """Base yt-dlp options, injecting cookies from env var when running on a server."""
+    opts = {"quiet": True, "no_warnings": True}
+    cookies = os.environ.get("YT_COOKIES", "").strip()
+    if cookies:
+        # Write cookies to a temp file for this call; caller is responsible for cleanup
+        tf = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix="ytc_")
+        tf.write(cookies)
+        tf.close()
+        opts["cookiefile"] = tf.name
+    return opts
+
+
+def _cleanup_cookiefile(opts):
+    path = opts.get("cookiefile")
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def extract_video_id(url):
     patterns = [
         r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
@@ -46,30 +68,30 @@ def extract_video_id(url):
 
 
 def get_video_title(url):
+    opts = _yt_opts_base()
+    opts["skip_download"] = True
     try:
-        opts = {"quiet": True, "skip_download": True, "no_warnings": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return info.get("title", "Unknown"), info.get("uploader", "")
     except Exception:
         return "Unknown", ""
+    finally:
+        _cleanup_cookiefile(opts)
 
 
 def download_audio(url, base_path):
-    opts = {
+    opts = _yt_opts_base()
+    opts.update({
         "format": "bestaudio/best",
         "outtmpl": base_path + ".%(ext)s",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-            }
-        ],
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+    })
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    finally:
+        _cleanup_cookiefile(opts)
 
     wav = base_path + ".wav"
     if os.path.exists(wav):
