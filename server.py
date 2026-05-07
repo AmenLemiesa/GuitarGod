@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import re
-import json
 import sys
 import shutil
 import subprocess
@@ -11,11 +10,11 @@ import time
 import uuid
 
 from flask import Flask, request, jsonify, send_from_directory, send_file
-import yt_dlp
 import librosa
 import numpy as np
 
 app = Flask(__name__, static_folder="static")
+app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150 MB upload limit
 
 # In-memory registry of short-lived fallback audio files: audio_id -> filepath
 _audio_store: dict = {}
@@ -32,179 +31,6 @@ def _schedule_audio_cleanup(audio_id: str, path: str, delay: int = 7200):
         except OSError:
             pass
     threading.Thread(target=_run, daemon=True).start()
-
-
-def _yt_opts_base():
-    return {"quiet": True, "no_warnings": True}
-
-
-_PIPED_INSTANCES = [
-    "pipedapi.kavin.rocks",
-    "piped.smnz.de",
-    "api.piped.yt",
-    "pipedapi.adminforge.de",
-    "pipedapi.darkness.services",
-    "piped-api.garudalinux.org",
-    "pipedapi.r4fo.com",
-]
-
-_INVIDIOUS_INSTANCES = [
-    "inv.tux.pizza",
-    "invidious.privacydev.net",
-    "yt.cdaut.de",
-    "yewtu.be",
-    "invidious.nerdvpn.de",
-    "invidious.io.lol",
-]
-
-
-def _ffmpeg_from_url(url, wav, timeout=180):
-    res = subprocess.run(
-        ["ffmpeg", "-y", "-i", url, wav],
-        capture_output=True, timeout=timeout,
-    )
-    return res.returncode == 0 and os.path.exists(wav)
-
-
-def _piped_download(video_id, base_path):
-    import urllib.request
-    wav = base_path + ".wav"
-    for host in _PIPED_INSTANCES:
-        try:
-            req = urllib.request.Request(
-                f"https://{host}/streams/{video_id}",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read())
-            streams = [s for s in data.get("audioStreams", []) if s.get("url")]
-            if not streams:
-                continue
-            best = max(streams, key=lambda s: s.get("bitrate", 0))
-            if _ffmpeg_from_url(best["url"], wav):
-                return wav
-        except Exception:
-            continue
-    return None
-
-
-def _invidious_download(video_id, base_path):
-    import urllib.request
-    wav = base_path + ".wav"
-    for host in _INVIDIOUS_INSTANCES:
-        try:
-            req = urllib.request.Request(
-                f"https://{host}/api/v1/videos/{video_id}?fields=adaptiveFormats",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read())
-            streams = [
-                f for f in data.get("adaptiveFormats", [])
-                if f.get("type", "").startswith("audio/")
-            ]
-            if not streams:
-                continue
-            best = max(streams, key=lambda s: int(s.get("bitrate", 0)))
-            if _ffmpeg_from_url(best["url"], wav):
-                return wav
-        except Exception:
-            continue
-    return None
-
-
-def extract_video_id(url):
-    patterns = [
-        r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
-
-
-def get_video_title(url):
-    opts = _yt_opts_base()
-    opts["skip_download"] = True
-    opts["extractor_args"] = {"youtube": {"player_client": ["tv_embedded", "ios"]}}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get("title", "Unknown"), info.get("uploader", "")
-    except Exception:
-        pass
-    # Piped fallback for title
-    video_id = extract_video_id(url)
-    if video_id:
-        import urllib.request
-        for host in _PIPED_INSTANCES:
-            try:
-                req = urllib.request.Request(
-                    f"https://{host}/streams/{video_id}",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    data = json.loads(r.read())
-                title = data.get("title") or "Unknown"
-                uploader = data.get("uploader") or ""
-                return title, uploader
-            except Exception:
-                continue
-    return "Unknown", ""
-
-
-def download_audio(url, base_path):
-    wav = base_path + ".wav"
-
-    # Layer 1: yt-dlp — try multiple player-client sets that bypass datacenter detection
-    _YT_CLIENT_SETS = [
-        ["android", "tv_embedded"],
-        ["ios", "mweb"],
-        ["web_creator", "android_testsuite"],
-        ["tv_embedded"],
-    ]
-    for clients in _YT_CLIENT_SETS:
-        opts = _yt_opts_base()
-        opts.update({
-            "format": "bestaudio/best",
-            "outtmpl": base_path + ".%(ext)s",
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
-            "extractor_args": {"youtube": {"player_client": clients}},
-        })
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-        except Exception:
-            pass
-        if os.path.exists(wav):
-            return wav
-        for ext in ["m4a", "webm", "mp3", "ogg", "opus"]:
-            src = base_path + "." + ext
-            if os.path.exists(src):
-                subprocess.run(["ffmpeg", "-y", "-i", src, wav], capture_output=True)
-                try:
-                    os.remove(src)
-                except OSError:
-                    pass
-                if os.path.exists(wav):
-                    return wav
-
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise FileNotFoundError(f"Could not produce WAV from {url}")
-
-    # Layer 2: Piped API (open YouTube proxy, non-datacenter IPs)
-    result = _piped_download(video_id, base_path)
-    if result:
-        return result
-
-    # Layer 3: Invidious API (another open proxy network)
-    result = _invidious_download(video_id, base_path)
-    if result:
-        return result
-
-    raise FileNotFoundError(f"Could not produce WAV from {url}")
 
 
 STEM_NAMES = {'vocals': 'vocals', 'bass': 'bass', 'drums': 'drums', 'guitar': 'other'}
@@ -474,52 +300,48 @@ def serve_audio(audio_id):
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    data = request.get_json(force=True)
-    url  = (data.get("url")  or "").strip()
-    mode = (data.get("mode") or "original").strip()
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "No file selected"}), 400
+
+    mode = (request.form.get("mode") or "original").strip()
     if mode not in ("original", "vocals", "bass", "drums", "guitar"):
         mode = "original"
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
 
-    video_id = extract_video_id(url)
-    if not video_id:
-        return jsonify({"error": "Could not parse YouTube video ID"}), 400
+    title = re.sub(r'\.[^.]+$', '', f.filename) if f.filename else "Unknown"
 
-    title, uploader = get_video_title(url)
-
-    # Every request gets its own temp directory — nothing is shared between sessions
     work_dir = tempfile.mkdtemp(prefix="guitargod_")
     audio_id = str(uuid.uuid4())
     mp3_path = os.path.join(work_dir, f"{audio_id}.mp3")
 
     try:
-        audio_base = os.path.join(work_dir, video_id)
-        try:
-            full_wav = download_audio(url, audio_base)
-        except Exception as e:
-            return jsonify({"error": f"Download failed: {e}"}), 500
+        ext = os.path.splitext(f.filename)[1].lower() if f.filename else ".bin"
+        uploaded_path = os.path.join(work_dir, f"upload{ext}")
+        f.save(uploaded_path)
 
-        # Fallback mp3 for when YouTube embedding is blocked
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", full_wav, "-q:a", "6", "-ac", "2", mp3_path],
-                capture_output=True,
-            )
-        except Exception:
-            pass
+        wav_path = os.path.join(work_dir, "audio.wav")
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-i", uploaded_path, wav_path],
+            capture_output=True,
+        )
+        if res.returncode != 0 or not os.path.exists(wav_path):
+            return jsonify({"error": "Could not decode audio — unsupported format"}), 400
+        full_wav = wav_path
 
-        # Stem separation if needed
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", full_wav, "-q:a", "6", "-ac", "2", mp3_path],
+            capture_output=True,
+        )
+
         if mode == "original":
             analyze_wav = full_wav
         else:
             try:
                 analyze_wav = separate_and_get_stem(full_wav, work_dir, mode)
             except Exception as e:
-                return jsonify({"error": (
-                    f"Stem separation failed. Make sure Demucs is installed: "
-                    f"pip install demucs — {e}"
-                )}), 500
+                return jsonify({"error": f"Stem separation failed: {e}"}), 500
 
         try:
             chart = generate_chart(analyze_wav)
@@ -527,23 +349,20 @@ def analyze():
             return jsonify({"error": f"Analysis failed: {e}"}), 500
 
     finally:
-        # Move the mp3 out before nuking the work dir
         final_mp3 = os.path.join(tempfile.gettempdir(), f"guitargod_{audio_id}.mp3")
         if os.path.exists(mp3_path):
             shutil.move(mp3_path, final_mp3)
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    # Register fallback audio — auto-deletes after 2 hours
     if os.path.exists(final_mp3):
         with _audio_lock:
             _audio_store[audio_id] = final_mp3
         _schedule_audio_cleanup(audio_id, final_mp3, delay=7200)
 
     chart.update({
-        "videoId": video_id,
         "audioId": audio_id,
         "title": title,
-        "uploader": uploader,
+        "uploader": "",
         "mode": mode,
     })
     return jsonify(chart)

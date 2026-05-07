@@ -22,11 +22,16 @@
       </div>
 
       <div class="start-input-wrap">
-        <div class="input-label">YOUTUBE URL</div>
-        <div class="input-row">
-          <input id="url-input" type="text" placeholder="https://youtube.com/watch?v=..." autocomplete="off" spellcheck="false" />
-          <button id="shred-btn">SHRED</button>
+        <div class="input-label">AUDIO FILE</div>
+        <div class="drop-zone" id="drop-zone">
+          <input type="file" id="file-input" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac,.opus,.mp4" />
+          <div class="drop-zone-inner">
+            <div class="drop-zone-icon">♪</div>
+            <div class="drop-zone-text" id="drop-zone-text">DROP FILE HERE</div>
+            <div class="drop-zone-sub">click to browse · mp3, wav, m4a, ogg…</div>
+          </div>
         </div>
+        <button id="shred-btn" disabled>SHRED</button>
         <div id="status-msg"></div>
       </div>
 
@@ -88,9 +93,6 @@
 
     <div id="game-layout">
       <div id="side-panel">
-        <div id="video-box">
-          <div id="yt-player"></div>
-        </div>
         <div id="now-playing">
           <div id="np-title"></div>
           <div id="np-artist"></div>
@@ -154,7 +156,6 @@
     <div id="countdown-num"></div>
   </div>
 
-  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/static/game.js"></script>
 </body>
 </html>

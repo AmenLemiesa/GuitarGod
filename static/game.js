@@ -49,10 +49,8 @@ let listenersOn = false;
 let canvas, ctx, rafId = null, lastTs = 0;
 
 // playback
-let ytPlayer = null, ytApiReady = false, audioEl = null;
-// cache which video IDs need the audio fallback so replay is instant
-let fallbackNeeded = {};
-let loadedVideoId = null;
+let audioEl = null;
+let selectedFile = null;
 
 // ─── DOM shorthand ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -103,88 +101,21 @@ function laneEdgeX(edge, y, hitY) {
   })(0);
 })();
 
-// ─── YouTube IFrame API ───────────────────────────────────────────────────────
-window.onYouTubeIframeAPIReady = () => { ytApiReady = true; };
-function waitYT() {
-  return new Promise(r => {
-    if (ytApiReady) { r(); return; }
-    const iv = setInterval(() => { if(ytApiReady){clearInterval(iv);r();} }, 80);
-  });
-}
-
-// ─── Player setup ─────────────────────────────────────────────────────────────
-async function setupPlayer(videoId) {
-  // If we already know this video can't be embedded, skip straight to fallback
-  if (fallbackNeeded[videoId]) {
-    spawnAudioFallback(videoId);
-    return;
-  }
-
-  await new Promise(resolve => {
-    function onErr() {
-      fallbackNeeded[videoId] = true;
-      spawnAudioFallback(videoId);
-      resolve();
-    }
-
-    if (ytPlayer && ytPlayer.loadVideoById) {
-      // Reuse existing player, load new (or same) video
-      ytPlayer.addEventListener('onError', onErr);
-      ytPlayer.loadVideoById({ videoId, startSeconds: 0 });
-      // Resolve after giving YouTube time to fire onError
-      setTimeout(resolve, 600);
-    } else {
-      ytPlayer = new YT.Player('yt-player', {
-        videoId,
-        width: 240, height: 135,
-        playerVars: { autoplay:0, controls:0, modestbranding:1, rel:0, iv_load_policy:3, disablekb:1 },
-        events: {
-          onReady: resolve,
-          onStateChange: e => { if (e.data===YT.PlayerState.ENDED && state==='playing') beginWinning(0); },
-          onError: onErr,
-        },
-      });
-    }
-  });
-}
-
-function spawnAudioFallback(videoId) {
-  // Show thumbnail
-  const box = $('video-box');
-  if (!box.querySelector('img')) {
-    box.innerHTML = '';
-    const img = document.createElement('img');
-    img.src = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-    img.style.cssText = 'width:240px;height:135px;object-fit:cover;display:block;';
-    box.appendChild(img);
-  }
-  // Use the session-unique audioId from the chart (not the videoId)
-  const audioUrl = chart.audioId ? `/audio/${chart.audioId}` : `/audio/${videoId}`;
-  audioEl = new Audio(audioUrl);
-  audioEl.onended = () => { if (state==='playing') beginWinning(0); };
-}
-
+// ─── Playback ─────────────────────────────────────────────────────────────────
 function playbackPlay() {
-  if (audioEl) {
-    audioEl.currentTime = 0;
-    audioEl.play().catch(()=>{});
-  } else if (ytPlayer?.playVideo) {
-    ytPlayer.seekTo(0, true);
-    ytPlayer.playVideo();
-  }
+  if (!audioEl) return;
+  audioEl.currentTime = 0;
+  audioEl.play().catch(()=>{});
 }
 function playbackPause() {
   if (audioEl) audioEl.pause();
-  else { try { ytPlayer.pauseVideo(); } catch {} }
 }
 function fadeOutAudio(durationMs) {
   const start = performance.now();
   const origVol = audioEl ? audioEl.volume : 1;
   (function tick() {
     const p = Math.min(1, (performance.now() - start) / durationMs);
-    const v = origVol * (1 - p);
-    if (audioEl) audioEl.volume = v;
-    else { try { ytPlayer.setVolume(v * 100); } catch {} }
+    if (audioEl) audioEl.volume = origVol * (1 - p);
     if (p < 1) requestAnimationFrame(tick);
   })();
 }
@@ -196,15 +127,7 @@ function beginWinning(fadeMs) {
 }
 
 function now() {
-  // Use wall clock to drive the runway before audio actually starts
-  if (audioEl) {
-    if (audioEl.currentTime > 0.01) return audioEl.currentTime;
-  } else {
-    try {
-      const t = ytPlayer.getCurrentTime();
-      if (t > 0.01) return t;
-    } catch {}
-  }
+  if (audioEl && audioEl.currentTime > 0.01) return audioEl.currentTime;
   return (performance.now() - gameWallStart) / 1000 - CFG.RUNWAY;
 }
 
@@ -272,24 +195,46 @@ function applyDifficulty(rawNotes) {
 // ─── Load flow (from start screen) ───────────────────────────────────────────
 function setStatus(msg) { $('status-msg').textContent = msg; }
 
-$('shred-btn').addEventListener('click', () => onSubmitURL($('url-input').value.trim()));
-$('url-input').addEventListener('keydown', e => { if (e.key==='Enter') onSubmitURL($('url-input').value.trim()); });
+const dropZone = $('drop-zone');
+const fileInput = $('file-input');
 
-async function onSubmitURL(url) {
-  if (!url || state === 'loading') return;
+function setFile(file) {
+  if (!file) return;
+  selectedFile = file;
+  const name = file.name.replace(/\.[^.]+$/, '');
+  $('drop-zone-text').textContent = name;
+  dropZone.classList.add('has-file');
+  $('shred-btn').disabled = false;
+}
+
+fileInput.addEventListener('change', e => setFile(e.target.files[0]));
+dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  setFile(e.dataTransfer.files[0]);
+});
+
+$('shred-btn').addEventListener('click', () => {
+  if (selectedFile) onSubmitFile(selectedFile);
+});
+
+async function onSubmitFile(file) {
+  if (!file || state === 'loading') return;
   state = 'loading';
   $('shred-btn').disabled = true;
   setStatus(currentMode === 'original'
-    ? 'DOWNLOADING AUDIO…'
+    ? 'ANALYZING…'
     : 'SEPARATING STEMS — MAY TAKE 3–10 MIN FIRST TIME…');
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('mode', currentMode);
 
   let res;
   try {
-    res = await fetch('/analyze', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url, mode: currentMode}),
-    });
+    res = await fetch('/analyze', { method: 'POST', body: fd });
   } catch {
     setStatus('SERVER UNREACHABLE — IS IT RUNNING?');
     goIdle(); return;
@@ -308,7 +253,7 @@ async function onSubmitURL(url) {
 
 function goIdle() {
   state = 'idle';
-  $('shred-btn').disabled = false;
+  $('shred-btn').disabled = !selectedFile;
 }
 
 // ─── Result screen buttons ────────────────────────────────────────────────────
@@ -360,32 +305,9 @@ async function beginGame(isReplay) {
   CFG.LANE_W    = Math.floor(canvas.width / CFG.LANE_COUNT);
   $('strike-keys').style.width = canvas.width + 'px';
 
-  // Player setup
-  await waitYT();
-
-  if (isReplay && fallbackNeeded[chart.videoId]) {
-    // Replay with audio fallback: just re-create the audio element
-    audioEl = null;
-    spawnAudioFallback(chart.videoId);
-  } else if (isReplay && loadedVideoId === chart.videoId && !fallbackNeeded[chart.videoId]) {
-    // Replay same video via YouTube: seek to 0, don't reload
-    audioEl = null;
-    try { ytPlayer.seekTo(0, true); ytPlayer.stopVideo(); } catch {}
-    await sleep(200);
-  } else {
-    // Fresh load (new video or first time)
-    audioEl = null;
-    const box = $('video-box');
-    // Restore iframe if it was replaced by a thumbnail
-    if (!box.querySelector('iframe') && !fallbackNeeded[chart.videoId]) {
-      box.innerHTML = '<div id="yt-player"></div>';
-      ytPlayer = null; // force full player re-creation
-    }
-    await setupPlayer(chart.videoId);
-    // Give YouTube's onError time to fire before countdown
-    await sleep(700);
-  }
-  loadedVideoId = chart.videoId;
+  // Set up audio element
+  audioEl = new Audio(`/audio/${chart.audioId}`);
+  audioEl.onended = () => { if (state === 'playing') beginWinning(0); };
 
   state = 'countdown';
   await runCountdown();
