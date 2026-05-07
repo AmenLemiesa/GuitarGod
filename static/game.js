@@ -31,6 +31,7 @@ const CFG = {
 let state = 'idle';
 let chart = null;
 let currentDifficulty = 'medium';
+let currentMode = 'original';
 let dyingTs = null;    // performance.now() when health first hit 0
 let winningTs = null;  // performance.now() when all notes settled
 let gameWallStart = 0; // performance.now() when the game loop started
@@ -167,6 +168,14 @@ document.querySelectorAll('.diff-btn').forEach(btn => {
   });
 });
 
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('mode-btn-active'));
+    btn.classList.add('mode-btn-active');
+    currentMode = btn.dataset.mode;
+  });
+});
+
 function applyDifficulty(rawNotes) {
   // Hard and extreme get all notes; extreme is just punishing on health
   if (currentDifficulty === 'hard' || currentDifficulty === 'extreme') return rawNotes;
@@ -215,7 +224,17 @@ function estimateBPM(onsetEnv, fps) {
   return 60 * fps / bestLag;
 }
 
-async function analyzeFile(file) {
+// Per-mode band weights: [bass, low-mid, high-mid, treble]
+// Controls which frequency ranges drive note placement
+const MODE_WEIGHTS = {
+  original: [1.0, 1.0, 1.0, 1.0],
+  vocals:   [0.1, 1.5, 1.5, 0.3],
+  bass:     [2.0, 0.3, 0.1, 0.0],
+  drums:    [1.5, 0.8, 0.8, 1.2],
+  guitar:   [0.2, 1.2, 2.0, 1.0],
+};
+
+async function analyzeFile(file, mode = 'original') {
   setStatus('DECODING AUDIO…');
   const arrayBuffer = await file.arrayBuffer();
   const initCtx = new AudioContext();
@@ -267,13 +286,16 @@ async function analyzeFile(file) {
     return fr;
   }));
 
-  // Onset envelope = positive spectral flux summed across bands
+  // Onset envelope = positive spectral flux summed across bands, weighted by mode
+  const weights = MODE_WEIGHTS[mode] || MODE_WEIGHTS.original;
   const onsetEnv = new Float32Array(numFrames);
   for (let b = 0; b < 4; b++) {
     const br = bandRms[b];
+    const w  = weights[b];
+    if (w === 0) continue;
     for (let i = 1; i < numFrames; i++) {
       const d = br[i] - br[i - 1];
-      if (d > 0) onsetEnv[i] += d;
+      if (d > 0) onsetEnv[i] += d * w;
     }
   }
 
@@ -321,10 +343,11 @@ async function analyzeFile(file) {
     if (onsetEnv[f] < strengthThresh) continue;
     if (time - lastAnyTime < 0.04) continue;
 
-    // Dominant band → preferred lane
+    // Dominant band → preferred lane (weighted by mode)
     let preferred = 0, maxE = -1;
     for (let b = 0; b < 4; b++) {
-      if (bandRms[b][f] > maxE) { maxE = bandRms[b][f]; preferred = b; }
+      const e = bandRms[b][f] * weights[b];
+      if (e > maxE) { maxE = e; preferred = b; }
     }
 
     let chosen = null;
@@ -390,7 +413,7 @@ async function onSubmitFile(file) {
 
   let chartData;
   try {
-    chartData = await analyzeFile(file);
+    chartData = await analyzeFile(file, currentMode);
   } catch(e) {
     setStatus(`ERROR: ${String(e).toUpperCase().slice(0, 80)}`);
     goIdle(); return;
@@ -398,7 +421,7 @@ async function onSubmitFile(file) {
 
   const audioUrl = URL.createObjectURL(file);
   const title    = file.name.replace(/\.[^.]+$/, '');
-  chart = { ...chartData, audioUrl, title, uploader: '' };
+  chart = { ...chartData, audioUrl, title, uploader: '', mode: currentMode };
   setStatus(`${applyDifficulty(chart.notes).length} NOTES — LOADING`);
   await beginGame(false);
 }
