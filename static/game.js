@@ -229,7 +229,7 @@ function estimateBPM(onsetEnv, fps) {
 }
 
 // Per-mode band weights: [bass, low-mid, high-mid, treble]
-// Controls which frequency ranges drive note placement
+// Controls which frequency ranges drive ONSET DETECTION (not lane assignment)
 const MODE_WEIGHTS = {
   original: [1.0, 1.0, 1.0, 1.0],
   vocals:   [0.1, 1.5, 1.5, 0.3],
@@ -238,7 +238,17 @@ const MODE_WEIGHTS = {
   guitar:   [0.2, 1.2, 2.0, 1.0],
 };
 
+// Per-mode analysis parameters
+const MODE_PARAMS = {
+  original: { minGap: 0.080, laneGap: 0.100, sPct: 0.50, hDecay: 0.30, maxHold: 1.6 },
+  vocals:   { minGap: 0.100, laneGap: 0.110, sPct: 0.42, hDecay: 0.40, maxHold: 2.2 },
+  bass:     { minGap: 0.090, laneGap: 0.100, sPct: 0.38, hDecay: 0.28, maxHold: 1.4 },
+  drums:    { minGap: 0.050, laneGap: 0.065, sPct: 0.46, hDecay: 0.18, maxHold: 0.10 },
+  guitar:   { minGap: 0.075, laneGap: 0.085, sPct: 0.42, hDecay: 0.33, maxHold: 1.8 },
+};
+
 async function analyzeFile(arrayBuffer, mode = 'original') {
+  const mp = MODE_PARAMS[mode] || MODE_PARAMS.original;
   setStatus('DECODING AUDIO…');
   const initCtx = new AudioContext();
   const fullBuffer = await initCtx.decodeAudioData(arrayBuffer);
@@ -316,7 +326,7 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
   }
 
   const NOISE_GATE = 0.06;
-  const MIN_GAP    = Math.round(0.08 * fps);
+  const MIN_GAP    = Math.round(mp.minGap * fps);
   const onsetFrames = [];
   let lastPick = -MIN_GAP;
   for (let i = 1; i < numFrames - 1; i++) {
@@ -330,9 +340,21 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
     }
   }
 
-  // 50th-percentile strength threshold
+  // Strength threshold by mode percentile
   const sorted = onsetFrames.map(f => onsetEnv[f]).sort((a, b) => a - b);
-  const strengthThresh = sorted[Math.floor(sorted.length * 0.5)] || 0;
+  const strengthThresh = sorted[Math.floor(sorted.length * mp.sPct)] || 0;
+
+  // Spectral centroid → lane by quartile (guarantees all 4 lanes are used)
+  const BAND_CENTERS = [145, 625, 2500, 5750];
+  const centroids = onsetFrames.map(f => {
+    let num = 0, den = 0;
+    for (let b = 0; b < 4; b++) { const e = bandRms[b][f]; num += BAND_CENTERS[b] * e; den += e; }
+    return den > 1e-9 ? num / den : BAND_CENTERS[1];
+  });
+  const sortedC = [...centroids].sort((a, b) => a - b);
+  const q25 = sortedC[Math.floor(sortedC.length * 0.25)] ?? 0;
+  const q50 = sortedC[Math.floor(sortedC.length * 0.50)] ?? 0;
+  const q75 = sortedC[Math.floor(sortedC.length * 0.75)] ?? 0;
 
   // Build note chart
   setStatus('MAPPING NOTES…');
@@ -341,32 +363,35 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
   let lastAnyTime = -999;
   const HOLD_MIN = 0.30;
 
-  for (const f of onsetFrames) {
+  for (let i = 0; i < onsetFrames.length; i++) {
+    const f = onsetFrames[i];
     const time = f * hop / sr;
     if (onsetEnv[f] < strengthThresh) continue;
-    if (time - lastAnyTime < 0.04) continue;
+    if (time - lastAnyTime < mp.minGap * 0.5) continue;
 
-    // Dominant band → preferred lane (weighted by mode)
-    let preferred = 0, maxE = -1;
-    for (let b = 0; b < 4; b++) {
-      const e = bandRms[b][f] * weights[b];
-      if (e > maxE) { maxE = e; preferred = b; }
-    }
+    // Lane by spectral centroid quartile (pitch-based, ensures 4-lane spread)
+    const c = centroids[i];
+    const preferred = c <= q25 ? 0 : c <= q50 ? 1 : c <= q75 ? 2 : 3;
 
     let chosen = null;
     for (let off = 0; off < 4; off++) {
       const lane = (preferred + off) % 4;
-      if (time - lastLaneTime[lane] >= 0.10) { chosen = lane; break; }
+      if (time - lastLaneTime[lane] >= mp.laneGap) { chosen = lane; break; }
     }
     if (chosen === null) continue;
 
-    // Hold: check how long dominant band energy sustains
+    // Hold: dominant weighted band drives sustain detection
+    let holdBand = 0, holdMaxE = -1;
+    for (let b = 0; b < 4; b++) {
+      const e = bandRms[b][f] * weights[b];
+      if (e > holdMaxE) { holdMaxE = e; holdBand = b; }
+    }
     let holdDur = 0;
-    const db = bandRms[preferred];
+    const db = bandRms[holdBand];
     const oe = db[f] + 1e-9;
-    const lookEnd = Math.min(f + Math.round(1.6 * fps), numFrames - 1);
+    const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
     for (let k = f + 1; k <= lookEnd; k++) {
-      if (db[k] / oe < 0.30) {
+      if (db[k] / oe < mp.hDecay) {
         const cand = (k - f) * hop / sr;
         if (cand >= HOLD_MIN) holdDur = cand;
         break;

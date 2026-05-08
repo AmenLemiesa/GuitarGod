@@ -56,6 +56,7 @@ def separate():
         track   = os.path.splitext(os.path.basename(wav))[0]
         r = subprocess.run(
             [sys.executable, "-m", "demucs", "-n", "htdemucs",
+             "--segment", "7", "--overlap", "0.1",
              "--out", tmp_out, wav],
             capture_output=True, text=True,
         )
