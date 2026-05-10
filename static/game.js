@@ -240,7 +240,7 @@ const MODE_WEIGHTS = {
 
 // Per-mode analysis parameters
 const MODE_PARAMS = {
-  original: { minGap: 0.080, laneGap: 0.100, sPct: 0.50, hDecay: 0.30, maxHold: 1.6 },
+  original: { minGap: 0.080, laneGap: 0.100, sPct: 0.50, hDecay: 0.20, maxHold: 1.2 },
   vocals:   { minGap: 0.100, laneGap: 0.110, sPct: 0.42, hDecay: 0.40, maxHold: 2.2 },
   bass:     { minGap: 0.090, laneGap: 0.100, sPct: 0.38, hDecay: 0.28, maxHold: 1.4 },
   drums:    { minGap: 0.050, laneGap: 0.065, sPct: 0.46, hDecay: 0.18, maxHold: 0.10 },
@@ -361,7 +361,7 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
   const notes = [];
   const lastLaneTime = [-999, -999, -999, -999];
   let lastAnyTime = -999;
-  const HOLD_MIN = 0.30;
+  const HOLD_MIN = 0.50;
 
   for (let i = 0; i < onsetFrames.length; i++) {
     const f = onsetFrames[i];
@@ -389,12 +389,29 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
     let holdDur = 0;
     const db = bandRms[holdBand];
     const oe = db[f] + 1e-9;
-    const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
-    for (let k = f + 1; k <= lookEnd; k++) {
-      if (db[k] / oe < mp.hDecay) {
+
+    // Only consider holds if the onset is strong enough and in sustaining frequencies
+    const onsetStrength = onsetEnv[f];
+    const avgOnsetStrength = sorted[Math.floor(sorted.length * 0.7)] || 0; // 70th percentile
+    const isSustainingBand = holdBand === 1 || holdBand === 2; // Mid frequencies more likely to sustain
+
+    if (onsetStrength >= avgOnsetStrength && isSustainingBand && oe > rms[f] * 0.8) {
+      const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
+      let sustainedFrames = 0;
+      let totalFrames = 0;
+
+      for (let k = f + 1; k <= lookEnd; k++) {
+        totalFrames++;
+        if (db[k] / oe >= mp.hDecay) {
+          sustainedFrames++;
+        } else {
+          // Allow brief dips but require overall sustain
+          if (sustainedFrames / totalFrames < 0.6) break;
+        }
         const cand = (k - f) * hop / sr;
-        if (cand >= HOLD_MIN) holdDur = cand;
-        break;
+        if (cand >= HOLD_MIN && sustainedFrames / totalFrames >= 0.7) {
+          holdDur = cand;
+        }
       }
     }
 

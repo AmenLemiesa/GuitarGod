@@ -193,7 +193,7 @@ def generate_chart(audio_path):
     last_any_time = -999.0
     MIN_LANE_GAP = 0.10
     MIN_GLOBAL_GAP = 0.04
-    HOLD_MIN = 0.30
+    HOLD_MIN = 0.50
 
     phrase_note_count = {}
 
@@ -236,27 +236,37 @@ def generate_chart(audio_path):
         if chosen is None:
             continue
 
-        # Hold detection using harmonic RMS sustain
+        # Hold detection using harmonic RMS sustain - more selective criteria
         hold_dur = 0.0
         onset_f = min(onset_frame, len(harm_rms) - 1)
-        look_end_t = min(onset_time + 1.6, duration - 0.05)
-        look_end_f = min(
-            int(librosa.time_to_frames(look_end_t, sr=sr, hop_length=HOP)),
-            len(harm_rms) - 1,
-        )
-        if look_end_f > onset_f:
-            onset_e = float(harm_rms[onset_f]) + 1e-9
-            window_rms = harm_rms[onset_f : look_end_f + 1]
-            ratio = window_rms / onset_e
-            drop_idx = np.where(ratio < 0.30)[0]
-            if len(drop_idx):
-                end_f = onset_f + int(drop_idx[0])
-                candidate = (
-                    float(librosa.frames_to_time(end_f, sr=sr, hop_length=HOP))
-                    - onset_time
-                )
-                if candidate >= HOLD_MIN:
-                    hold_dur = candidate
+
+        # Only consider holds for strong harmonic onsets
+        if not is_percussive and strength > strength_thresh * 1.2:
+            look_end_t = min(onset_time + 1.2, duration - 0.05)
+            look_end_f = min(
+                int(librosa.time_to_frames(look_end_t, sr=sr, hop_length=HOP)),
+                len(harm_rms) - 1,
+            )
+            if look_end_f > onset_f:
+                onset_e = float(harm_rms[onset_f]) + 1e-9
+                window_rms = harm_rms[onset_f : look_end_f + 1]
+                ratio = window_rms / onset_e
+
+                # Require stronger sustain (20% drop instead of 30%)
+                sustained_frames = np.sum(ratio >= 0.20)
+                total_frames = len(ratio)
+
+                # Require at least 70% of frames to be sustained
+                if sustained_frames / total_frames >= 0.70:
+                    drop_idx = np.where(ratio < 0.20)[0]
+                    if len(drop_idx):
+                        end_f = onset_f + int(drop_idx[0])
+                        candidate = (
+                            float(librosa.frames_to_time(end_f, sr=sr, hop_length=HOP))
+                            - onset_time
+                        )
+                        if candidate >= HOLD_MIN:
+                            hold_dur = candidate
 
         notes.append({
             "time": float(onset_time),
