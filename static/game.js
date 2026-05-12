@@ -2,16 +2,12 @@
 
 // ─── Analytics Tracking ──────────────────────────────────────────────────────
 function trackEvent(action, label = '', mode = '') {
-  console.log('Tracking event:', action, label, mode || currentMode || 'unknown');
   if (typeof gtag !== 'undefined') {
     gtag('event', action, {
       event_category: 'user_interaction',
       event_label: label,
       mode: mode || currentMode || 'unknown'
     });
-    console.log('Event sent to GA');
-  } else {
-    console.log('gtag not available');
   }
 }
 
