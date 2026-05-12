@@ -1,5 +1,16 @@
 'use strict';
 
+// ─── Analytics Tracking ──────────────────────────────────────────────────────
+function trackEvent(action, label = '', mode = '') {
+  if (typeof gtag !== 'undefined') {
+    gtag('event', action, {
+      event_category: 'user_interaction',
+      event_label: label,
+      mode: mode || currentMode || 'unknown'
+    });
+  }
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const CFG = {
   LANE_W:        90,
@@ -173,6 +184,7 @@ document.querySelectorAll('.mode-btn').forEach(btn => {
     document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('mode-btn-active'));
     btn.classList.add('mode-btn-active');
     currentMode = btn.dataset.mode;
+    trackEvent('mode_selected', currentMode);
   });
 });
 
@@ -436,6 +448,7 @@ function setFile(file) {
   $('drop-zone-text').textContent = name;
   dropZone.classList.add('has-file');
   $('shred-btn').disabled = false;
+  trackEvent('file_selected', name);
 }
 
 dropZone.addEventListener('click',     ()  => fileInput.click());
@@ -458,6 +471,7 @@ async function onSubmitFile(file) {
   $('shred-btn').disabled = true;
 
   const title = file.name.replace(/\.[^.]+$/, '');
+  trackEvent('analysis_started', title);
   let chartData, audioUrl;
 
   try {
@@ -521,6 +535,9 @@ async function beginGame(isReplay) {
   stopLoop();
   removeListeners();
   playbackPause();
+
+  // Track game start
+  trackEvent('game_started', isReplay ? 'replay' : 'new', chart?.mode);
 
   // Reset game state — apply difficulty filter to raw chart
   const filteredNotes = applyDifficulty(chart.notes);
@@ -1147,6 +1164,10 @@ function endGame(failed) {
   else { try { ytPlayer.setVolume(100); } catch {} }
 
   const acc = totalNotes > 0 ? Math.round((hitCnt / totalNotes) * 100) : 0;
+
+  // Track game completion
+  trackEvent('game_completed', failed ? 'failed' : 'success', chart?.mode);
+  trackEvent('game_score', `${score}_${acc}%_accuracy`, chart?.mode);
   $('result-headline').textContent = failed ? 'FAITH BROKEN' : 'ASCENDED';
   $('result-song').textContent     = chart?.title || '';
   $('r-score').textContent   = String(score).padStart(7,'0');
