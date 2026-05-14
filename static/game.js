@@ -242,61 +242,177 @@ const STEM_FILTERS = {
 async function applySmartStemFilter(audioBuffer, mode) {
   if (mode === 'original') return audioBuffer;
 
-  const filter = STEM_FILTERS[mode];
-  if (!filter) return audioBuffer;
-
   const sr = audioBuffer.sampleRate;
-  const ctx = new OfflineAudioContext(1, audioBuffer.length, sr);
+
+  // Advanced stem separation using spectral processing
+  switch (mode) {
+    case 'vocals':
+      return await extractVocals(audioBuffer);
+    case 'drums':
+      return await extractDrums(audioBuffer);
+    case 'bass':
+      return await extractBass(audioBuffer);
+    case 'guitar':
+      return await extractGuitar(audioBuffer);
+    default:
+      return audioBuffer;
+  }
+}
+
+async function extractVocals(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
+
+  // Center channel extraction (vocals usually centered)
+  const splitter = ctx.createChannelSplitter(2);
+  const merger = ctx.createChannelMerger(2);
   const src = ctx.createBufferSource();
   src.buffer = audioBuffer;
 
-  let node = src;
+  // Create mono from stereo to isolate center channel
+  const leftGain = ctx.createGain();
+  const rightGain = ctx.createGain();
+  leftGain.gain.value = 0.5;
+  rightGain.gain.value = -0.5; // Invert right channel
 
-  // Apply filters in sequence
-  if (filter.highpass) {
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = filter.highpass;
-    hp.Q.value = 0.707;
-    node.connect(hp);
-    node = hp;
-  }
+  src.connect(splitter);
+  splitter.connect(leftGain, 0);
+  splitter.connect(rightGain, 1);
 
-  if (filter.lowpass) {
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = filter.lowpass;
-    lp.Q.value = 0.707;
-    node.connect(lp);
-    node = lp;
-  }
+  // Mix inverted channels to isolate center
+  const mixGain = ctx.createGain();
+  leftGain.connect(mixGain);
+  rightGain.connect(mixGain);
 
-  // Apply EQ boosts and cuts
-  if (filter.boost) {
-    for (const [freq, q, gain] of filter.boost) {
-      const eq = ctx.createBiquadFilter();
-      eq.type = 'peaking';
-      eq.frequency.value = freq;
-      eq.Q.value = q || 1;
-      eq.gain.value = gain;
-      node.connect(eq);
-      node = eq;
-    }
-  }
+  // Vocal-specific EQ
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 300; // Cut low rumble
+  hp.Q.value = 0.707;
 
-  if (filter.reduce) {
-    for (const [freq, q, gain] of filter.reduce) {
-      const eq = ctx.createBiquadFilter();
-      eq.type = 'peaking';
-      eq.frequency.value = freq;
-      eq.Q.value = q || 1;
-      eq.gain.value = gain;
-      node.connect(eq);
-      node = eq;
-    }
-  }
+  const presence = ctx.createBiquadFilter();
+  presence.type = 'peaking';
+  presence.frequency.value = 2500; // Boost vocal presence
+  presence.Q.value = 1.5;
+  presence.gain.value = 6;
 
-  node.connect(ctx.destination);
+  mixGain.connect(hp);
+  hp.connect(presence);
+  presence.connect(merger, 0, 0);
+  presence.connect(merger, 0, 1);
+  merger.connect(ctx.destination);
+
+  src.start();
+  return ctx.startRendering();
+}
+
+async function extractDrums(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+
+  // Transient enhancement for drums
+  const compressor = ctx.createDynamicsCompressor();
+  compressor.threshold.value = -24;
+  compressor.knee.value = 30;
+  compressor.ratio.value = 12;
+  compressor.attack.value = 0.003;
+  compressor.release.value = 0.25;
+
+  // Drum frequency enhancement
+  const kickBoost = ctx.createBiquadFilter();
+  kickBoost.type = 'peaking';
+  kickBoost.frequency.value = 60;
+  kickBoost.Q.value = 1;
+  kickBoost.gain.value = 8;
+
+  const snareBoost = ctx.createBiquadFilter();
+  snareBoost.type = 'peaking';
+  snareBoost.frequency.value = 200;
+  snareBoost.Q.value = 1;
+  snareBoost.gain.value = 4;
+
+  const hihatBoost = ctx.createBiquadFilter();
+  hihatBoost.type = 'peaking';
+  hihatBoost.frequency.value = 8000;
+  hihatBoost.Q.value = 1;
+  hihatBoost.gain.value = 6;
+
+  src.connect(compressor);
+  compressor.connect(kickBoost);
+  kickBoost.connect(snareBoost);
+  snareBoost.connect(hihatBoost);
+  hihatBoost.connect(ctx.destination);
+
+  src.start();
+  return ctx.startRendering();
+}
+
+async function extractBass(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+
+  // Strong low-pass for bass isolation
+  const lp1 = ctx.createBiquadFilter();
+  lp1.type = 'lowpass';
+  lp1.frequency.value = 150;
+  lp1.Q.value = 2;
+
+  const lp2 = ctx.createBiquadFilter();
+  lp2.type = 'lowpass';
+  lp2.frequency.value = 300;
+  lp2.Q.value = 0.707;
+
+  // Bass frequency boost
+  const bassBoost = ctx.createBiquadFilter();
+  bassBoost.type = 'peaking';
+  bassBoost.frequency.value = 80;
+  bassBoost.Q.value = 1;
+  bassBoost.gain.value = 10;
+
+  src.connect(lp1);
+  lp1.connect(lp2);
+  lp2.connect(bassBoost);
+  bassBoost.connect(ctx.destination);
+
+  src.start();
+  return ctx.startRendering();
+}
+
+async function extractGuitar(audioBuffer) {
+  const sr = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+
+  // Guitar-specific processing
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 100;
+  hp.Q.value = 0.707;
+
+  // Remove vocal frequencies
+  const vocalCut = ctx.createBiquadFilter();
+  vocalCut.type = 'peaking';
+  vocalCut.frequency.value = 1000;
+  vocalCut.Q.value = 2;
+  vocalCut.gain.value = -8;
+
+  // Boost guitar presence
+  const presence = ctx.createBiquadFilter();
+  presence.type = 'peaking';
+  presence.frequency.value = 3000;
+  presence.Q.value = 1;
+  presence.gain.value = 6;
+
+  src.connect(hp);
+  hp.connect(vocalCut);
+  vocalCut.connect(presence);
+  presence.connect(ctx.destination);
+
   src.start();
   return ctx.startRendering();
 }
@@ -391,10 +507,10 @@ const MODE_WEIGHTS = {
 // Per-mode analysis parameters
 const MODE_PARAMS = {
   original: { minGap: 0.080, laneGap: 0.100, sPct: 0.50, hDecay: 0.20, maxHold: 1.2 },
-  vocals:   { minGap: 0.100, laneGap: 0.110, sPct: 0.42, hDecay: 0.40, maxHold: 2.2 },
-  bass:     { minGap: 0.090, laneGap: 0.100, sPct: 0.38, hDecay: 0.28, maxHold: 1.4 },
-  drums:    { minGap: 0.050, laneGap: 0.065, sPct: 0.46, hDecay: 0.18, maxHold: 0.10 },
-  guitar:   { minGap: 0.075, laneGap: 0.085, sPct: 0.42, hDecay: 0.33, maxHold: 1.8 },
+  vocals:   { minGap: 0.200, laneGap: 0.250, sPct: 0.65, hDecay: 0.40, maxHold: 0.8 }, // Longer gaps, less holds
+  bass:     { minGap: 0.150, laneGap: 0.200, sPct: 0.55, hDecay: 0.28, maxHold: 0.6 }, // Steady rhythm, short holds
+  drums:    { minGap: 0.080, laneGap: 0.100, sPct: 0.40, hDecay: 0.18, maxHold: 0.0 }, // Fast hits, NO holds
+  guitar:   { minGap: 0.120, laneGap: 0.150, sPct: 0.50, hDecay: 0.33, maxHold: 1.0 }, // Medium spacing, some holds
 };
 
 async function analyzeFile(arrayBuffer, mode = 'original') {
@@ -519,9 +635,28 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
     if (onsetEnv[f] < strengthThresh) continue;
     if (time - lastAnyTime < mp.minGap * 0.5) continue;
 
-    // Lane by spectral centroid quartile (pitch-based, ensures 4-lane spread)
-    const c = centroids[i];
-    const preferred = c <= q25 ? 0 : c <= q50 ? 1 : c <= q75 ? 2 : 3;
+    // Stem-specific lane assignment strategy
+    let preferred;
+    if (mode === 'drums') {
+      // Drums: Use rhythm-based patterns (kick = lanes 0,3, snare = lanes 1,2)
+      const beatIndex = Math.floor(time * 2) % 4; // 8th note grid
+      preferred = beatIndex % 2 === 0 ? [0, 3][Math.floor(Math.random() * 2)] : [1, 2][Math.floor(Math.random() * 2)];
+    } else if (mode === 'bass') {
+      // Bass: Prefer lower lanes (0,1) with some variation
+      preferred = Math.random() < 0.7 ? [0, 1][Math.floor(Math.random() * 2)] : Math.floor(Math.random() * 4);
+    } else if (mode === 'vocals') {
+      // Vocals: Center lanes (1,2) mostly, with melodic variation
+      const c = centroids[i];
+      preferred = c <= q50 ? 1 : 2; // Simpler vocal patterns
+    } else if (mode === 'guitar') {
+      // Guitar: Full range but avoid too much bass lane overlap
+      const c = centroids[i];
+      preferred = c <= q25 ? 1 : c <= q50 ? 2 : c <= q75 ? 2 : 3; // Bias away from lane 0
+    } else {
+      // Original mode: spectral centroid quartile
+      const c = centroids[i];
+      preferred = c <= q25 ? 0 : c <= q50 ? 1 : c <= q75 ? 2 : 3;
+    }
 
     let chosen = null;
     for (let off = 0; off < 4; off++) {
@@ -540,27 +675,61 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
     const db = bandRms[holdBand];
     const oe = db[f] + 1e-9;
 
-    // Only consider holds if the onset is strong enough and in sustaining frequencies
-    const onsetStrength = onsetEnv[f];
-    const avgOnsetStrength = sorted[Math.floor(sorted.length * 0.7)] || 0; // 70th percentile
-    const isSustainingBand = holdBand === 1 || holdBand === 2; // Mid frequencies more likely to sustain
-
-    if (onsetStrength >= avgOnsetStrength && isSustainingBand && oe > rms[f] * 0.8) {
-      const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
-      let sustainedFrames = 0;
-      let totalFrames = 0;
-
-      for (let k = f + 1; k <= lookEnd; k++) {
-        totalFrames++;
-        if (db[k] / oe >= mp.hDecay) {
-          sustainedFrames++;
-        } else {
-          // Allow brief dips but require overall sustain
-          if (sustainedFrames / totalFrames < 0.6) break;
+    // Stem-specific hold note logic
+    if (mode === 'drums') {
+      // Drums: NO hold notes ever - all hits should be taps
+      holdDur = 0;
+    } else if (mode === 'vocals') {
+      // Vocals: Very selective holds, shorter duration, avoid long sustained notes
+      const onsetStrength = onsetEnv[f];
+      const avgOnsetStrength = sorted[Math.floor(sorted.length * 0.8)] || 0; // 80th percentile (more selective)
+      if (onsetStrength >= avgOnsetStrength && oe > rms[f] * 0.9) {
+        const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
+        let sustainCount = 0;
+        for (let k = f + 1; k <= lookEnd && k < f + Math.round(0.6 * fps); k++) { // Max 0.6 seconds
+          if (db[k] / oe >= 0.4) sustainCount++;
         }
-        const cand = (k - f) * hop / sr;
-        if (cand >= HOLD_MIN && sustainedFrames / totalFrames >= 0.7) {
-          holdDur = cand;
+        if (sustainCount >= Math.round(0.4 * fps)) { // At least 0.4s sustained
+          holdDur = Math.min(0.6, sustainCount * hop / sr); // Cap at 0.6s
+        }
+      }
+    } else if (mode === 'bass') {
+      // Bass: Short holds for sustained bass notes
+      const onsetStrength = onsetEnv[f];
+      const avgOnsetStrength = sorted[Math.floor(sorted.length * 0.6)] || 0;
+      if (onsetStrength >= avgOnsetStrength && oe > rms[f] * 0.7) {
+        const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
+        let sustainCount = 0;
+        for (let k = f + 1; k <= lookEnd; k++) {
+          if (db[k] / oe >= 0.3) sustainCount++;
+          else break;
+        }
+        if (sustainCount >= Math.round(HOLD_MIN * fps)) {
+          holdDur = Math.min(mp.maxHold, sustainCount * hop / sr);
+        }
+      }
+    } else {
+      // Guitar and original: existing logic but more restrictive
+      const onsetStrength = onsetEnv[f];
+      const avgOnsetStrength = sorted[Math.floor(sorted.length * 0.7)] || 0;
+      const isSustainingBand = holdBand === 1 || holdBand === 2;
+
+      if (onsetStrength >= avgOnsetStrength && isSustainingBand && oe > rms[f] * 0.8) {
+        const lookEnd = Math.min(f + Math.round(mp.maxHold * fps), numFrames - 1);
+        let sustainedFrames = 0;
+        let totalFrames = 0;
+
+        for (let k = f + 1; k <= lookEnd; k++) {
+          totalFrames++;
+          if (db[k] / oe >= mp.hDecay) {
+            sustainedFrames++;
+          } else {
+            if (sustainedFrames / totalFrames < 0.6) break;
+          }
+          const cand = (k - f) * hop / sr;
+          if (cand >= HOLD_MIN && sustainedFrames / totalFrames >= 0.7) {
+            holdDur = cand;
+          }
         }
       }
     }
