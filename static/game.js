@@ -213,6 +213,144 @@ const ANALYSIS_SR  = 16000;
 const ANALYSIS_HOP = 512;
 const MAX_ANALYSIS_SECS = 300; // 5 min cap
 
+// Smart frequency filtering for instant "stems"
+const STEM_FILTERS = {
+  vocals: {
+    highpass: 200,
+    lowpass: 8000,
+    boost: [[1000, 3000, 6]], // boost 1-3kHz by 6dB for vocals
+    reduce: [[60, 250, -12]]   // reduce bass by 12dB
+  },
+  bass: {
+    lowpass: 250,
+    boost: [[60, 120, 8]],     // boost sub-bass by 8dB
+    reduce: [[2000, 8000, -15]] // heavily reduce treble
+  },
+  drums: {
+    highpass: 80,
+    boost: [[100, 200, 4], [1000, 8000, 6]], // boost kick and snare/hi-hat
+    reduce: [[300, 800, -6]]   // reduce muddy mids
+  },
+  guitar: {
+    highpass: 80,
+    lowpass: 12000,
+    boost: [[200, 800, 3], [2000, 4000, 4]], // boost guitar fundamentals and presence
+    reduce: [[60, 150, -8]]    // reduce bass bleed
+  }
+};
+
+async function applySmartStemFilter(audioBuffer, mode) {
+  if (mode === 'original') return audioBuffer;
+
+  const filter = STEM_FILTERS[mode];
+  if (!filter) return audioBuffer;
+
+  const sr = audioBuffer.sampleRate;
+  const ctx = new OfflineAudioContext(1, audioBuffer.length, sr);
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuffer;
+
+  let node = src;
+
+  // Apply filters in sequence
+  if (filter.highpass) {
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = filter.highpass;
+    hp.Q.value = 0.707;
+    node.connect(hp);
+    node = hp;
+  }
+
+  if (filter.lowpass) {
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = filter.lowpass;
+    lp.Q.value = 0.707;
+    node.connect(lp);
+    node = lp;
+  }
+
+  // Apply EQ boosts and cuts
+  if (filter.boost) {
+    for (const [freq, q, gain] of filter.boost) {
+      const eq = ctx.createBiquadFilter();
+      eq.type = 'peaking';
+      eq.frequency.value = freq;
+      eq.Q.value = q || 1;
+      eq.gain.value = gain;
+      node.connect(eq);
+      node = eq;
+    }
+  }
+
+  if (filter.reduce) {
+    for (const [freq, q, gain] of filter.reduce) {
+      const eq = ctx.createBiquadFilter();
+      eq.type = 'peaking';
+      eq.frequency.value = freq;
+      eq.Q.value = q || 1;
+      eq.gain.value = gain;
+      node.connect(eq);
+      node = eq;
+    }
+  }
+
+  node.connect(ctx.destination);
+  src.start();
+  return ctx.startRendering();
+}
+
+// Helper functions for audio format conversion
+async function bufferToArrayBuffer(audioBuffer) {
+  const numberOfChannels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
+
+  // Create a new ArrayBuffer for WAV format
+  const buffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
+  const view = new DataView(buffer);
+
+  // WAV header
+  const writeString = (offset, string) => {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + length * numberOfChannels * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numberOfChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numberOfChannels * 2, true);
+  view.setUint16(32, numberOfChannels * 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, length * numberOfChannels * 2, true);
+
+  // Convert audio data
+  let offset = 44;
+  for (let i = 0; i < length; i++) {
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+      const sample = audioBuffer.getChannelData(channel)[i];
+      view.setInt16(offset, sample * 0x7FFF, true);
+      offset += 2;
+    }
+  }
+
+  return buffer;
+}
+
+async function bufferToObjectURL(audioBuffer) {
+  const arrayBuffer = await bufferToArrayBuffer(audioBuffer);
+  const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
+  return URL.createObjectURL(blob);
+}
+
 async function renderBandEnergy(audioBuffer, loHz, hiHz) {
   const sr  = audioBuffer.sampleRate;
   const ctx = new OfflineAudioContext(1, audioBuffer.length, sr);
@@ -435,6 +573,23 @@ async function analyzeFile(arrayBuffer, mode = 'original') {
   return { bpm, duration, notes };
 }
 
+// ─── Progress Bar Control ────────────────────────────────────────────────────
+function showProgress() {
+  $('progress-container').style.display = 'block';
+  $('status-msg').style.display = 'none';
+}
+
+function hideProgress() {
+  $('progress-container').style.display = 'none';
+  $('status-msg').style.display = 'block';
+}
+
+function updateProgress(percent, label) {
+  $('progress-fill').style.width = `${percent}%`;
+  $('progress-percent').textContent = `${Math.round(percent)}%`;
+  if (label) $('progress-label').textContent = label;
+}
+
 // ─── Load flow (from start screen) ───────────────────────────────────────────
 function setStatus(msg) { $('status-msg').textContent = msg; }
 
@@ -475,35 +630,47 @@ async function onSubmitFile(file) {
   let chartData, audioUrl;
 
   try {
+    showProgress();
+    updateProgress(10, 'Loading audio file...');
+
+    const arrayBuffer = await file.arrayBuffer();
+    updateProgress(25, 'Decoding audio...');
+
     if (currentMode === 'original') {
-      // Fully client-side
-      const arrayBuffer = await file.arrayBuffer();
+      // Original mode - no stem processing needed
+      updateProgress(50, 'Analyzing music structure...');
       chartData = await analyzeFile(arrayBuffer, 'original');
-      audioUrl  = URL.createObjectURL(file);
-    } else {
-      // Stem separation via Render API → analyze stem client-side
-      setStatus('SEPARATING STEMS — MAY TAKE A MINUTE…');
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('mode', currentMode);
-      let res;
-      try {
-        res = await fetch(`${API_BASE}/separate`, { method: 'POST', body: fd });
-      } catch {
-        setStatus('STEM SERVER UNREACHABLE');
-        goIdle(); return;
-      }
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        setStatus(`ERROR: ${(err.error || 'STEM FAILED').toUpperCase()}`);
-        goIdle(); return;
-      }
-      const stemBlob = await res.blob();
       audioUrl = URL.createObjectURL(file);
-      const stemBuffer = await stemBlob.arrayBuffer();
-      chartData = await analyzeFile(stemBuffer, currentMode);
+      updateProgress(100, 'Ready to play!');
+    } else {
+      // Smart stem filtering - much faster than server-side separation
+      updateProgress(40, `Processing ${currentMode} track...`);
+
+      // Decode the audio for processing
+      const audioCtx = new AudioContext();
+      const fullBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      await audioCtx.close();
+
+      updateProgress(60, `Applying ${currentMode} filtering...`);
+
+      // Apply smart stem filter
+      const stemBuffer = await applySmartStemFilter(fullBuffer, currentMode);
+
+      updateProgress(80, 'Analyzing filtered audio...');
+
+      // Convert filtered buffer back to arrayBuffer for analysis
+      const stemArrayBuffer = await bufferToArrayBuffer(stemBuffer);
+      chartData = await analyzeFile(stemArrayBuffer, currentMode);
+
+      // Use filtered audio for playback
+      audioUrl = await bufferToObjectURL(stemBuffer);
+      updateProgress(100, `${currentMode.toUpperCase()} track ready!`);
     }
+
+    await sleep(500); // Brief pause to show 100%
+    hideProgress();
   } catch(e) {
+    hideProgress();
     setStatus(`ERROR: ${String(e).toUpperCase().slice(0, 80)}`);
     goIdle(); return;
   }
