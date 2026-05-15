@@ -25,10 +25,9 @@
     <canvas id="bg-canvas"></canvas>
     <div class="start-content">
       <div class="start-logo">
-        <div class="logo-eyebrow">GUITAR</div>
+        <div class="logo-eyebrow">— GUITAR —</div>
         <div class="logo-main">GOD</div>
-        <div class="logo-sub">Turn any song into a playable rhythm game</div>
-        <div class="logo-desc">Upload your favorite track and play along to automatically generated note charts. Works with any audio file.</div>
+        <div class="logo-sub">drop a track. ascend.</div>
       </div>
 
       <div class="start-input-wrap">
@@ -38,10 +37,10 @@
           <div class="drop-zone-inner">
             <div class="drop-zone-icon">♪</div>
             <div class="drop-zone-text" id="drop-zone-text">DROP FILE HERE</div>
-            <div class="drop-zone-sub">or click to browse • supports mp3, wav, m4a, ogg</div>
+            <div class="drop-zone-sub">click to browse · mp3, wav, m4a, ogg…</div>
           </div>
         </div>
-        <button id="shred-btn" disabled>START GAME</button>
+        <button id="shred-btn" disabled>SHRED</button>
         <div id="status-msg"></div>
         <div id="progress-container" style="display: none;">
           <div id="progress-label">Processing audio...</div>
@@ -63,15 +62,15 @@
       </div>
 
       <div class="mode-wrap">
-        <div class="input-label">TRACK MODE</div>
+        <div class="input-label">MODE</div>
         <div class="mode-original-row">
-          <button class="mode-btn mode-btn-active" data-mode="original">FULL TRACK</button>
+          <button class="mode-btn mode-btn-active" data-mode="original">ORIGINAL</button>
         </div>
         <div class="mode-stems-row">
-          <button class="mode-btn" data-mode="vocals">VOCALS ONLY</button>
-          <button class="mode-btn" data-mode="bass">BASS ONLY</button>
-          <button class="mode-btn" data-mode="drums">DRUMS ONLY</button>
-          <button class="mode-btn" data-mode="guitar">GUITAR ONLY</button>
+          <button class="mode-btn" data-mode="vocals">VOCALS</button>
+          <button class="mode-btn" data-mode="bass">BASS</button>
+          <button class="mode-btn" data-mode="drums">DRUMS</button>
+          <button class="mode-btn" data-mode="guitar">GUITAR</button>
         </div>
       </div>
 
@@ -82,7 +81,7 @@
           <div class="ctrl-key" data-i="2">J</div>
           <div class="ctrl-key" data-i="3">K</div>
         </div>
-        <div class="controls-hint">Use D-F-J-K keys to hit notes as they reach the line</div>
+        <div class="controls-hint">tap keys to hit notes as they reach the strike line</div>
       </div>
     </div>
   </div>

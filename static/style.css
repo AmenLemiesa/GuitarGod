@@ -92,15 +92,6 @@ html, body {
   margin-top: 14px;
   text-transform: uppercase;
 }
-.logo-desc {
-  font-size: 14px;
-  color: var(--text);
-  margin-top: 16px;
-  max-width: 420px;
-  line-height: 1.4;
-  text-align: center;
-  opacity: 0.8;
-}
 
 /* input area */
 .start-input-wrap {
