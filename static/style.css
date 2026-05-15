@@ -92,6 +92,15 @@ html, body {
   margin-top: 14px;
   text-transform: uppercase;
 }
+.logo-desc {
+  font-size: 14px;
+  color: var(--text);
+  margin-top: 16px;
+  max-width: 420px;
+  line-height: 1.4;
+  text-align: center;
+  opacity: 0.8;
+}
 
 /* input area */
 .start-input-wrap {
@@ -669,10 +678,13 @@ html, body {
 
 /* ─── Progress Bar ────────────────────────────────────────────────────── */
 #progress-container {
-  margin-top: 20px;
+  margin: 20px auto;
   width: 100%;
   max-width: 400px;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 #progress-label {

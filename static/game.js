@@ -213,259 +213,7 @@ const ANALYSIS_SR  = 16000;
 const ANALYSIS_HOP = 512;
 const MAX_ANALYSIS_SECS = 300; // 5 min cap
 
-// Smart frequency filtering for instant "stems"
-const STEM_FILTERS = {
-  vocals: {
-    highpass: 200,
-    lowpass: 8000,
-    boost: [[1000, 3000, 6]], // boost 1-3kHz by 6dB for vocals
-    reduce: [[60, 250, -12]]   // reduce bass by 12dB
-  },
-  bass: {
-    lowpass: 250,
-    boost: [[60, 120, 8]],     // boost sub-bass by 8dB
-    reduce: [[2000, 8000, -15]] // heavily reduce treble
-  },
-  drums: {
-    highpass: 80,
-    boost: [[100, 200, 4], [1000, 8000, 6]], // boost kick and snare/hi-hat
-    reduce: [[300, 800, -6]]   // reduce muddy mids
-  },
-  guitar: {
-    highpass: 80,
-    lowpass: 12000,
-    boost: [[200, 800, 3], [2000, 4000, 4]], // boost guitar fundamentals and presence
-    reduce: [[60, 150, -8]]    // reduce bass bleed
-  }
-};
 
-async function applySmartStemFilter(audioBuffer, mode) {
-  if (mode === 'original') return audioBuffer;
-
-  const sr = audioBuffer.sampleRate;
-
-  // Advanced stem separation using spectral processing
-  switch (mode) {
-    case 'vocals':
-      return await extractVocals(audioBuffer);
-    case 'drums':
-      return await extractDrums(audioBuffer);
-    case 'bass':
-      return await extractBass(audioBuffer);
-    case 'guitar':
-      return await extractGuitar(audioBuffer);
-    default:
-      return audioBuffer;
-  }
-}
-
-async function extractVocals(audioBuffer) {
-  const sr = audioBuffer.sampleRate;
-  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
-
-  // Center channel extraction (vocals usually centered)
-  const splitter = ctx.createChannelSplitter(2);
-  const merger = ctx.createChannelMerger(2);
-  const src = ctx.createBufferSource();
-  src.buffer = audioBuffer;
-
-  // Create mono from stereo to isolate center channel
-  const leftGain = ctx.createGain();
-  const rightGain = ctx.createGain();
-  leftGain.gain.value = 0.5;
-  rightGain.gain.value = -0.5; // Invert right channel
-
-  src.connect(splitter);
-  splitter.connect(leftGain, 0);
-  splitter.connect(rightGain, 1);
-
-  // Mix inverted channels to isolate center
-  const mixGain = ctx.createGain();
-  leftGain.connect(mixGain);
-  rightGain.connect(mixGain);
-
-  // Vocal-specific EQ
-  const hp = ctx.createBiquadFilter();
-  hp.type = 'highpass';
-  hp.frequency.value = 300; // Cut low rumble
-  hp.Q.value = 0.707;
-
-  const presence = ctx.createBiquadFilter();
-  presence.type = 'peaking';
-  presence.frequency.value = 2500; // Boost vocal presence
-  presence.Q.value = 1.5;
-  presence.gain.value = 6;
-
-  mixGain.connect(hp);
-  hp.connect(presence);
-  presence.connect(merger, 0, 0);
-  presence.connect(merger, 0, 1);
-  merger.connect(ctx.destination);
-
-  src.start();
-  return ctx.startRendering();
-}
-
-async function extractDrums(audioBuffer) {
-  const sr = audioBuffer.sampleRate;
-  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
-  const src = ctx.createBufferSource();
-  src.buffer = audioBuffer;
-
-  // Transient enhancement for drums
-  const compressor = ctx.createDynamicsCompressor();
-  compressor.threshold.value = -24;
-  compressor.knee.value = 30;
-  compressor.ratio.value = 12;
-  compressor.attack.value = 0.003;
-  compressor.release.value = 0.25;
-
-  // Drum frequency enhancement
-  const kickBoost = ctx.createBiquadFilter();
-  kickBoost.type = 'peaking';
-  kickBoost.frequency.value = 60;
-  kickBoost.Q.value = 1;
-  kickBoost.gain.value = 8;
-
-  const snareBoost = ctx.createBiquadFilter();
-  snareBoost.type = 'peaking';
-  snareBoost.frequency.value = 200;
-  snareBoost.Q.value = 1;
-  snareBoost.gain.value = 4;
-
-  const hihatBoost = ctx.createBiquadFilter();
-  hihatBoost.type = 'peaking';
-  hihatBoost.frequency.value = 8000;
-  hihatBoost.Q.value = 1;
-  hihatBoost.gain.value = 6;
-
-  src.connect(compressor);
-  compressor.connect(kickBoost);
-  kickBoost.connect(snareBoost);
-  snareBoost.connect(hihatBoost);
-  hihatBoost.connect(ctx.destination);
-
-  src.start();
-  return ctx.startRendering();
-}
-
-async function extractBass(audioBuffer) {
-  const sr = audioBuffer.sampleRate;
-  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
-  const src = ctx.createBufferSource();
-  src.buffer = audioBuffer;
-
-  // Strong low-pass for bass isolation
-  const lp1 = ctx.createBiquadFilter();
-  lp1.type = 'lowpass';
-  lp1.frequency.value = 150;
-  lp1.Q.value = 2;
-
-  const lp2 = ctx.createBiquadFilter();
-  lp2.type = 'lowpass';
-  lp2.frequency.value = 300;
-  lp2.Q.value = 0.707;
-
-  // Bass frequency boost
-  const bassBoost = ctx.createBiquadFilter();
-  bassBoost.type = 'peaking';
-  bassBoost.frequency.value = 80;
-  bassBoost.Q.value = 1;
-  bassBoost.gain.value = 10;
-
-  src.connect(lp1);
-  lp1.connect(lp2);
-  lp2.connect(bassBoost);
-  bassBoost.connect(ctx.destination);
-
-  src.start();
-  return ctx.startRendering();
-}
-
-async function extractGuitar(audioBuffer) {
-  const sr = audioBuffer.sampleRate;
-  const ctx = new OfflineAudioContext(2, audioBuffer.length, sr);
-  const src = ctx.createBufferSource();
-  src.buffer = audioBuffer;
-
-  // Guitar-specific processing
-  const hp = ctx.createBiquadFilter();
-  hp.type = 'highpass';
-  hp.frequency.value = 100;
-  hp.Q.value = 0.707;
-
-  // Remove vocal frequencies
-  const vocalCut = ctx.createBiquadFilter();
-  vocalCut.type = 'peaking';
-  vocalCut.frequency.value = 1000;
-  vocalCut.Q.value = 2;
-  vocalCut.gain.value = -8;
-
-  // Boost guitar presence
-  const presence = ctx.createBiquadFilter();
-  presence.type = 'peaking';
-  presence.frequency.value = 3000;
-  presence.Q.value = 1;
-  presence.gain.value = 6;
-
-  src.connect(hp);
-  hp.connect(vocalCut);
-  vocalCut.connect(presence);
-  presence.connect(ctx.destination);
-
-  src.start();
-  return ctx.startRendering();
-}
-
-// Helper functions for audio format conversion
-async function bufferToArrayBuffer(audioBuffer) {
-  const numberOfChannels = audioBuffer.numberOfChannels;
-  const length = audioBuffer.length;
-  const sampleRate = audioBuffer.sampleRate;
-
-  // Create a new ArrayBuffer for WAV format
-  const buffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
-  const view = new DataView(buffer);
-
-  // WAV header
-  const writeString = (offset, string) => {
-    for (let i = 0; i < string.length; i++) {
-      view.setUint8(offset + i, string.charCodeAt(i));
-    }
-  };
-
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + length * numberOfChannels * 2, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, numberOfChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numberOfChannels * 2, true);
-  view.setUint16(32, numberOfChannels * 2, true);
-  view.setUint16(34, 16, true);
-  writeString(36, 'data');
-  view.setUint32(40, length * numberOfChannels * 2, true);
-
-  // Convert audio data
-  let offset = 44;
-  for (let i = 0; i < length; i++) {
-    for (let channel = 0; channel < numberOfChannels; channel++) {
-      const sample = audioBuffer.getChannelData(channel)[i];
-      view.setInt16(offset, sample * 0x7FFF, true);
-      offset += 2;
-    }
-  }
-
-  return buffer;
-}
-
-async function bufferToObjectURL(audioBuffer) {
-  const arrayBuffer = await bufferToArrayBuffer(audioBuffer);
-  const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
-}
 
 async function renderBandEnergy(audioBuffer, loHz, hiHz) {
   const sr  = audioBuffer.sampleRate;
@@ -812,27 +560,50 @@ async function onSubmitFile(file) {
       audioUrl = URL.createObjectURL(file);
       updateProgress(100, 'Ready to play!');
     } else {
-      // Smart stem filtering - much faster than server-side separation
-      updateProgress(40, `Processing ${currentMode} track...`);
+      // High-quality stem separation via HF API with progress tracking
+      updateProgress(25, `Uploading ${currentMode} track...`);
 
-      // Decode the audio for processing
-      const audioCtx = new AudioContext();
-      const fullBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-      await audioCtx.close();
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('mode', currentMode);
 
-      updateProgress(60, `Applying ${currentMode} filtering...`);
+      updateProgress(40, 'Processing with AI stem separation...');
 
-      // Apply smart stem filter
-      const stemBuffer = await applySmartStemFilter(fullBuffer, currentMode);
+      let res;
+      try {
+        // Add timeout and better error handling
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 min timeout
 
-      updateProgress(80, 'Analyzing filtered audio...');
+        res = await fetch(`${API_BASE}/separate`, {
+          method: 'POST',
+          body: fd,
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          updateProgress(0, 'Request timed out - try a shorter audio file');
+        } else {
+          updateProgress(0, 'Stem server unreachable');
+        }
+        goIdle(); return;
+      }
 
-      // Convert filtered buffer back to arrayBuffer for analysis
-      const stemArrayBuffer = await bufferToArrayBuffer(stemBuffer);
-      chartData = await analyzeFile(stemArrayBuffer, currentMode);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        updateProgress(0, `Error: ${(err.error || 'Stem failed').toLowerCase()}`);
+        goIdle(); return;
+      }
 
-      // Use filtered audio for playback
-      audioUrl = await bufferToObjectURL(stemBuffer);
+      updateProgress(80, `Downloading ${currentMode} stem...`);
+      const stemBlob = await res.blob();
+
+      updateProgress(90, 'Analyzing separated audio...');
+      audioUrl = URL.createObjectURL(file); // Use original for now
+      const stemBuffer = await stemBlob.arrayBuffer();
+      chartData = await analyzeFile(stemBuffer, currentMode);
+
       updateProgress(100, `${currentMode.toUpperCase()} track ready!`);
     }
 
